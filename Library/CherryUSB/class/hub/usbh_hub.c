@@ -315,7 +315,9 @@ static void hub_int_complete_callback(void *arg, int nbytes)
     } else if (nbytes > 0) {
         hub->int_poll_count = 0;
         hub->int_error_count = 0;
-        usbh_hub_thread_wakeup(hub);
+        if (usbh_hub_thread_wakeup(hub) < 0) {
+            usb_osal_timer_start(hub->int_timer);
+        }
     } else {
         if (nbytes != -USB_ERR_NAK) {
             hub->int_error_count++;
@@ -331,7 +333,9 @@ static void hub_int_complete_callback(void *arg, int nbytes)
             flags = usb_osal_enter_critical_section();
             hub->rescan_mask |= rescan_mask;
             usb_osal_leave_critical_section(flags);
-            usbh_hub_thread_wakeup(hub);
+            if (usbh_hub_thread_wakeup(hub) < 0) {
+                usb_osal_timer_start(hub->int_timer);
+            }
             /* CherryUSB deviation: periodically rescan after missed changes. */
         } else {
             usb_osal_timer_start(hub->int_timer);
@@ -482,7 +486,9 @@ static int usbh_hub_connect(struct usbh_hubport *hport, uint8_t intf)
     }
     if (initial_port_mask) {
         hub->rescan_mask = initial_port_mask;
-        usbh_hub_thread_wakeup(hub);
+        if (usbh_hub_thread_wakeup(hub) < 0) {
+            usb_osal_timer_start(hub->int_timer);
+        }
         /* CherryUSB deviation: enumerate devices already connected at hub attach. */
     } else {
         usb_osal_timer_start(hub->int_timer);
@@ -778,9 +784,9 @@ static void usbh_hub_thread(CONFIG_USB_OSAL_THREAD_SET_ARGV)
     usb_osal_thread_delete(NULL);
 }
 
-void usbh_hub_thread_wakeup(struct usbh_hub *hub)
+int usbh_hub_thread_wakeup(struct usbh_hub *hub)
 {
-    usb_osal_mq_send(hub->bus->hub_mq, (uintptr_t)hub);
+    return usb_osal_mq_send(hub->bus->hub_mq, (uintptr_t)hub);
 }
 
 int usbh_hub_initialize(struct usbh_bus *bus)

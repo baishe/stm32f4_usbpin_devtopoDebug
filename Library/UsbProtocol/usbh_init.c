@@ -14,7 +14,7 @@
 /* -------------------------------------------------------------------------- */
 static SemaphoreHandle_t g_winusb_sem = NULL;
 static char g_winusb_devname[CONFIG_USBHOST_DEV_NAMELEN];
-static volatile bool g_winusb_disconnect = false;
+static volatile uint32_t g_winusb_disconnect_seq = 0;
 
 static void HostDemoTask(void *pvParameters);
 
@@ -78,7 +78,6 @@ int usbh_winusb_check(struct usbh_hubport *hport)
 /* -------------------------------------------------------------------------- */
 void usbh_winusb_notify_connect(const char *devname)
 {
-    g_winusb_disconnect = false;
     if (g_winusb_sem != NULL) {
         strncpy(g_winusb_devname, devname, CONFIG_USBHOST_DEV_NAMELEN - 1);
         g_winusb_devname[CONFIG_USBHOST_DEV_NAMELEN - 1] = '\0';
@@ -89,7 +88,7 @@ void usbh_winusb_notify_connect(const char *devname)
 void usbh_winusb_notify_disconnect(const char *devname)
 {
     (void)devname;
-    g_winusb_disconnect = true;
+    g_winusb_disconnect_seq++;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -137,6 +136,7 @@ static void HostDemoTask(void *pvParameters)
 {
     const char *devname;
     uint8_t rx_buf[64];
+    uint32_t disconnect_seq;
     int ret;
 
     for (;;) {
@@ -144,7 +144,7 @@ static void HostDemoTask(void *pvParameters)
         if (xSemaphoreTake(g_winusb_sem, portMAX_DELAY) == pdTRUE) {
             devname = g_winusb_devname;
 
-            g_winusb_disconnect = false;
+            disconnect_seq = g_winusb_disconnect_seq;
             winusb = usbh_winusb_open(devname, 0);
             if (!winusb) {
                 USB_LOG_ERR("Failed to open %s\r\n", devname);
@@ -153,14 +153,14 @@ static void HostDemoTask(void *pvParameters)
             USB_LOG_INFO("WinUSB device %s opened\r\n", devname);
 
             /* 阻塞读循环：等待 Device 端通过串口触发写入 */
-            while (!g_winusb_disconnect) {
+            while (g_winusb_disconnect_seq == disconnect_seq) {
                 ret = usbh_winusb_read(winusb, rx_buf, sizeof(rx_buf));
                 if (ret > 0) {
                     USB_LOG_INFO("Received %d bytes\r\n", ret);
                     usb_hexdump(rx_buf, ret);
                 } else {
                     /* 检查设备是否拔出 */
-                    if (g_winusb_disconnect) {
+                    if (g_winusb_disconnect_seq != disconnect_seq) {
                         USB_LOG_WRN("Device %s disconnected\r\n", devname);
                         winusb = NULL;
                         break;

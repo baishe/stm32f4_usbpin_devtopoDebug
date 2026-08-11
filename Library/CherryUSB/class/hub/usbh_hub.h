@@ -17,7 +17,7 @@ extern "C" {
 int usbh_hub_set_feature(struct usbh_hub *hub, uint8_t port, uint8_t feature);
 int usbh_hub_clear_feature(struct usbh_hub *hub, uint8_t port, uint8_t feature);
 
-void usbh_hub_thread_wakeup(struct usbh_hub *hub);
+int usbh_hub_thread_wakeup(struct usbh_hub *hub);
 
 int usbh_hub_initialize(struct usbh_bus *bus);
 int usbh_hub_deinitialize(struct usbh_bus *bus);
