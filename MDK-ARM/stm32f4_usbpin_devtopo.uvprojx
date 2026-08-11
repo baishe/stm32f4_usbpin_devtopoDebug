@@ -673,6 +673,16 @@
           </Files>
         </Group>
         <Group>
+          <GroupName>./Library</GroupName>
+          <Files>
+            <File>
+              <FileName>uart_log.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Library\uart_log.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
           <GroupName>::CMSIS</GroupName>
         </Group>
       </Groups>
