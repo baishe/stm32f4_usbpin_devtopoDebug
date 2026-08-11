@@ -16,6 +16,7 @@
 #define HUB_DEBOUNCE_STEP      25
 #define HUB_DEBOUNCE_STABLE    100
 #define DELAY_TIME_AFTER_RESET 200
+#define HUB_RESCAN_INTERVAL    8
 
 #define EXTHUB_FIRST_INDEX 2
 
@@ -307,28 +308,52 @@ static void hub_int_complete_callback(void *arg, int nbytes)
 {
     struct usbh_hub *hub = (struct usbh_hub *)arg;
 
-    if (nbytes > 0) {
+    if (!hub->connected || nbytes == -USB_ERR_SHUTDOWN) {
+        return;
+    } else if (nbytes > 0) {
         usbh_hub_thread_wakeup(hub);
     } else if (nbytes == -USB_ERR_NAK) {
         /* Restart timer to submit urb again */
         USB_LOG_DBG("Restart timer\r\n");
         usb_osal_timer_start(hub->int_timer);
     } else {
+        USB_LOG_WRN("Hub interrupt transfer failed, errorcode: %d\r\n", nbytes);
+        usb_osal_timer_start(hub->int_timer);
     }
 }
 
 static void hub_int_timeout(void *arg)
 {
     struct usbh_hub *hub = (struct usbh_hub *)arg;
+    uint16_t rescan_mask;
+    size_t flags;
+    int ret;
 
+    if (!hub->connected) {
+        return;
+    }
+
+    if (++hub->int_poll_count >= HUB_RESCAN_INTERVAL) {
+        hub->int_poll_count = 0;
+        rescan_mask = (uint16_t)((1U << (hub->nports + 1)) - 2U);
+        flags = usb_osal_enter_critical_section();
+        hub->rescan_mask |= rescan_mask;
+        usb_osal_leave_critical_section(flags);
+        /* CherryUSB deviation: periodically rescan port status. */
+    }
     usbh_int_urb_fill(&hub->intin_urb, hub->parent, hub->intin, hub->int_buffer, 1, 0, hub_int_complete_callback, hub);
-    usbh_submit_urb(&hub->intin_urb);
+    ret = usbh_submit_urb(&hub->intin_urb);
+    if (ret < 0 && hub->connected) {
+        USB_LOG_WRN("Failed to submit hub interrupt urb, errorcode: %d\r\n", ret);
+        usb_osal_timer_start(hub->int_timer);
+    }
 }
 
 static int usbh_hub_connect(struct usbh_hubport *hport, uint8_t intf)
 {
     struct usb_endpoint_descriptor *ep_desc;
     struct hub_port_status port_status;
+    uint16_t initial_port_mask = 0;
     int ret;
 
     struct usbh_hub *hub = usbh_hub_class_alloc();
@@ -422,9 +447,12 @@ static int usbh_hub_connect(struct usbh_hubport *hport, uint8_t intf)
 
     for (uint8_t port = 0; port < hub->nports; port++) {
         ret = usbh_hub_get_portstatus(hub, port + 1, &port_status);
-        USB_LOG_DBG("port %u, status:0x%03x, change:0x%02x\r\n", port + 1, port_status.wPortStatus, port_status.wPortChange);
         if (ret < 0) {
             return ret;
+        }
+        USB_LOG_DBG("port %u, status:0x%03x, change:0x%02x\r\n", port + 1, port_status.wPortStatus, port_status.wPortChange);
+        if (port_status.wPortStatus & HUB_PORT_STATUS_CONNECTION) {
+            initial_port_mask |= (uint16_t)(1U << (port + 1));
         }
     }
 
@@ -441,6 +469,11 @@ static int usbh_hub_connect(struct usbh_hubport *hport, uint8_t intf)
         return -USB_ERR_NOMEM;
     }
     usb_osal_timer_start(hub->int_timer);
+    if (initial_port_mask) {
+        hub->rescan_mask = initial_port_mask;
+        usbh_hub_thread_wakeup(hub);
+        /* CherryUSB deviation: enumerate devices already connected at hub attach. */
+    }
     return 0;
 }
 
@@ -486,6 +519,7 @@ static void usbh_hub_events(struct usbh_hub *hub)
     uint16_t mask;
     uint16_t feat;
     uint8_t speed;
+    bool port_needs_handling;
     int ret;
     size_t flags;
 
@@ -497,6 +531,8 @@ static void usbh_hub_events(struct usbh_hub *hub)
 
     flags = usb_osal_enter_critical_section();
     memcpy(&portchange_index, hub->int_buffer, 2);
+    portchange_index |= hub->rescan_mask;
+    hub->rescan_mask = 0;
     usb_osal_leave_critical_section(flags);
 
     for (uint8_t port = 0; port < hub->nports; port++) {
@@ -539,7 +575,10 @@ static void usbh_hub_events(struct usbh_hub *hub)
         portchange = port_status.wPortChange;
 
         /* Second, if port changes, debounces first */
-        if (portchange & HUB_PORT_STATUS_C_CONNECTION) {
+        port_needs_handling = (portchange & HUB_PORT_STATUS_C_CONNECTION) ||
+                              ((portstatus & HUB_PORT_STATUS_CONNECTION) && !hub->child[port].connected) ||
+                              (!(portstatus & HUB_PORT_STATUS_CONNECTION) && hub->child[port].connected);
+        if (port_needs_handling) {
             uint16_t connection = 0;
             uint16_t debouncestable = 0;
             for (uint32_t debouncetime = 0; debouncetime < HUB_DEBOUNCE_TIMEOUT; debouncetime += HUB_DEBOUNCE_STEP) {

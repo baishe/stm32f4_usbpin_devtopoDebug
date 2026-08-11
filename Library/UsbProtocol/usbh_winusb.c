@@ -42,6 +42,11 @@ __attribute__((weak)) void usbh_winusb_notify_connect(const char *devname)
     /* Ä¬ÈÏ¿ÕÊµÏÖ */
 }
 
+__attribute__((weak)) void usbh_winusb_notify_disconnect(const char *devname)
+{
+    (void)devname;
+}
+
 static struct usbh_winusb *usbh_winusb_alloc(void)
 {
     uint8_t devno;
@@ -152,6 +157,7 @@ static int usbh_winusb_disconnect(struct usbh_hubport *hport, uint8_t intf)
 {
     struct usbh_winusb *winusb = (struct usbh_winusb *)hport->config.intf[intf].priv;
     if (winusb) {
+        usbh_winusb_notify_disconnect(hport->config.intf[intf].devname);
         usbh_winusb_close(winusb);
         usbh_winusb_free(winusb);
         hport->config.intf[intf].priv = NULL;
