@@ -1,0 +1,25 @@
+T3D58 000:011.083   SEGGER J-Link V8.16 Log File
+T3D58 000:011.193   DLL Compiled: Feb 26 2025 12:07:26
+T3D58 000:011.204   Logging started @ 2026-05-15 12:10
+T3D58 000:011.214   Process: D:\Develop\Keil_v5\UV4\UV4.exe
+T3D58 000:011.230 - 11.224ms 
+T3D58 000:011.243 JLINK_SetWarnOutHandler(...)
+T3D58 000:011.253 - 0.010ms 
+T3D58 000:011.266 JLINK_OpenEx(...)
+T3D58 000:014.421   
+  ***** Warning: 
+T3D58 000:014.448   Out of sync , resynchronizing...
+T3D58 008:904.660   
+  ***** Warning: 
+T3D58 008:904.779   Out of sync , resynchronizing...
+T3D58 008:905.159   
+  ***** Warning: 
+T3D58 008:905.242   Out of sync , resynchronizing...
+T3D58 008:905.427   
+  ***** Error: 
+T3D58 008:905.490   Cannot connect to J-Link
+T3D58 008:906.027 - 8894.758ms returns "Cannot connect to J-Link"
+T3D58 014:793.779 JLINK_Close()
+T3D58 014:801.160 - 7.379ms
+T3D58 014:801.195   
+T3D58 014:801.206   Closed

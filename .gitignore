@@ -1,0 +1,5 @@
+Drivers/
+.mxproject
+MDK-ARM/stm32f4_usbpin_devtopo/
+Middlewares/
+MDK-ARM/RTE/
