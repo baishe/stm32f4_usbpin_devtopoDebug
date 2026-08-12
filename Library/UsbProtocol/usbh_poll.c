@@ -77,6 +77,7 @@ static volatile uint32_t g_pool_empty;
 static volatile uint32_t g_evtq_high;
 static volatile uint32_t g_evt_drop;
 static volatile uint32_t g_timeout_count;
+static volatile bool g_dwt_ok;
 static volatile uint8_t g_selftest_state = USBH_POLL_SELFTEST_IDLE;
 static volatile uint8_t g_selftest_slot = 0xff;
 static volatile bool g_selftest_reported;
@@ -87,6 +88,25 @@ static struct poll_selftest_sample g_selftest_samples[USBH_POLL_SELFTEST_COUNT];
 static uint32_t poll_cycles(void)
 {
     return DWT->CYCCNT;
+}
+
+static bool poll_dwt_enable(void)
+{
+    uint32_t before;
+    volatile uint32_t delay;
+    uint8_t attempt;
+
+    for (attempt = 0; attempt < 3; attempt++) {
+        CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+        DWT->LAR = 0xC5ACCE55U;
+        DWT->CYCCNT = 0;
+        DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+        before = DWT->CYCCNT;
+        for (delay = 0; delay < 512U; delay++) {
+        }
+        if (DWT->CYCCNT != before) return true;
+    }
+    return false;
 }
 
 static uint32_t poll_cycles_to_us(uint32_t cycles)
@@ -399,6 +419,24 @@ static void poll_selftest_report(void)
         g_selftest_reported = true;
         return;
     }
+    if (!g_dwt_ok) {
+        for (i = 0; i < g_selftest_n; i++) {
+            int rc = g_selftest_samples[i].rc;
+            if (rc == -USB_ERR_NAK) nak++;
+            else if (rc == 0) zero++;
+            else other++;
+        }
+        USB_LOG_INFO("[selftest] n=%u rc(nak/zero/other)=%lu/%lu/%lu us_x10(min/avg/max)=na/na/na\r\n",
+                     g_selftest_n, (unsigned long)nak, (unsigned long)zero,
+                     (unsigned long)other);
+        USB_LOG_INFO("[selftest] hist(<10/10-20/20-50/50-100/>100us)=na/na/na/na/na\r\n");
+        for (i = 0; i < 20 && i < g_selftest_n; i++) {
+            USB_LOG_INFO("[selftest] sample[%u] us_x10=na rc=%d\r\n", i,
+                         g_selftest_samples[i].rc);
+        }
+        g_selftest_reported = true;
+        return;
+    }
     for (i = 0; i < g_selftest_n; i++) {
         uint32_t us_x10 = g_selftest_samples[i].us_x10;
         int rc = g_selftest_samples[i].rc;
@@ -434,7 +472,7 @@ static void poll_complete(void *arg, int nbytes)
     struct usbh_urb *urb = &s->urb;
     uint8_t *buf = s->buf;
     uint32_t elapsed_cyc = (uint32_t)(poll_cycles() - s->start_cyc);
-    uint32_t elapsed = poll_cycles_to_us(elapsed_cyc);
+    uint32_t elapsed = g_dwt_ok ? poll_cycles_to_us(elapsed_cyc) : 0;
     bool timeout = s->timeout_pending;
     bool unregister = s->unregister_pending;
     size_t flags;
@@ -444,13 +482,15 @@ static void poll_complete(void *arg, int nbytes)
     if (g_inflight) g_inflight--;
     s->state = POLL_IDLE;
     poll_critical_leave(flags);
-    s->last_us = elapsed;
-    if (elapsed > s->max_us) s->max_us = elapsed;
-    if (elapsed < g_busy_min) g_busy_min = elapsed;
-    if (elapsed > g_busy_max) g_busy_max = elapsed;
-    if (elapsed > g_busy_max_all) g_busy_max_all = elapsed;
-    g_busy_sum += elapsed;
-    g_busy_count++;
+    if (g_dwt_ok) {
+        s->last_us = elapsed;
+        if (elapsed > s->max_us) s->max_us = elapsed;
+        if (elapsed < g_busy_min) g_busy_min = elapsed;
+        if (elapsed > g_busy_max) g_busy_max = elapsed;
+        if (elapsed > g_busy_max_all) g_busy_max_all = elapsed;
+        g_busy_sum += elapsed;
+        g_busy_count++;
+    }
     s->timeout_pending = false;
 
     if (timeout || unregister) {
@@ -487,7 +527,7 @@ static void poll_complete(void *arg, int nbytes)
     if (s->selftest) {
         uint16_t n = s->selftest_count;
         if (n < USBH_POLL_SELFTEST_COUNT) {
-            uint32_t us_x10 = poll_cycles_to_us_x10(elapsed_cyc);
+            uint32_t us_x10 = g_dwt_ok ? poll_cycles_to_us_x10(elapsed_cyc) : 0;
             g_selftest_samples[n].us_x10 =
                 us_x10 > 0xffffU ? 0xffffU : (uint16_t)us_x10;
             g_selftest_samples[n].rc = (int8_t)urb->errorcode;
@@ -541,6 +581,7 @@ static void poll_watchdog(void)
 {
     uint32_t now = poll_cycles();
     uint8_t i;
+    if (!g_dwt_ok) return;
     for (i = 0; i < USBH_POLL_MAX_SLOTS; i++) {
         struct poll_slot *s = &g_slots[i];
         size_t flags;
@@ -598,7 +639,8 @@ static void poll_task(void *arg)
         poll_watchdog();
         poll_drain_reports();
         if (g_selftest_state == USBH_POLL_SELFTEST_RUNNING) {
-            if (poll_cycles_to_us((uint32_t)(poll_cycles() - g_selftest_start_cyc)) >= 2000000U) {
+            if (g_dwt_ok &&
+                poll_cycles_to_us((uint32_t)(poll_cycles() - g_selftest_start_cyc)) >= 2000000U) {
                 if (g_selftest_slot < USBH_POLL_MAX_SLOTS) {
                     struct poll_slot *selftest_slot = &g_slots[g_selftest_slot];
                     size_t flags;
@@ -639,9 +681,10 @@ static void poll_task(void *arg)
 
 void usbh_poll_init(void)
 {
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CYCCNT = 0;
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    g_dwt_ok = poll_dwt_enable();
+    if (!g_dwt_ok) {
+        USB_LOG_INFO("[poll] DWT unavailable, timing disabled\r\n");
+    }
     g_event_queue = xQueueCreate(8, sizeof(struct usbh_poll_event));
     xTaskCreate(poll_task, "UsbPoll", 256, NULL, tskIDLE_PRIORITY + 1, &g_poll_task);
 }
@@ -822,24 +865,43 @@ void usbh_poll_stats_dump(void)
     poll_critical_leave(flags);
     busy_avg = busy_count ? (uint32_t)(busy_sum / busy_count) : 0;
     poll_selftest_report();
-    USB_LOG_INFO("[poll] round=%lu overrun=%lu scan=%lu busy_us(min/avg/max)=%lu/%lu/%lu max_all=%lu pool_empty=%lu evtq_high=%lu urbto=%lu evt_drop=%lu\r\n",
-                 (unsigned long)g_round, (unsigned long)g_overrun, (unsigned long)g_scan_snapshot,
-                 (unsigned long)busy_min, (unsigned long)busy_avg,
-                 (unsigned long)busy_max, (unsigned long)busy_max_all,
-                 (unsigned long)g_pool_empty, (unsigned long)g_evtq_high,
-                 (unsigned long)g_timeout_count, (unsigned long)evt_drop);
+    if (g_dwt_ok) {
+        USB_LOG_INFO("[poll] round=%lu overrun=%lu scan=%lu busy_us(min/avg/max)=%lu/%lu/%lu max_all=%lu pool_empty=%lu evtq_high=%lu urbto=%lu evt_drop=%lu\r\n",
+                     (unsigned long)g_round, (unsigned long)g_overrun, (unsigned long)g_scan_snapshot,
+                     (unsigned long)busy_min, (unsigned long)busy_avg,
+                     (unsigned long)busy_max, (unsigned long)busy_max_all,
+                     (unsigned long)g_pool_empty, (unsigned long)g_evtq_high,
+                     (unsigned long)g_timeout_count, (unsigned long)evt_drop);
+    } else {
+        USB_LOG_INFO("[poll] round=%lu overrun=%lu scan=%lu busy_us(min/avg/max)=na/na/na max_all=na pool_empty=%lu evtq_high=%lu urbto=%lu evt_drop=%lu\r\n",
+                     (unsigned long)g_round, (unsigned long)g_overrun, (unsigned long)g_scan_snapshot,
+                     (unsigned long)g_pool_empty, (unsigned long)g_evtq_high,
+                     (unsigned long)g_timeout_count, (unsigned long)evt_drop);
+    }
     for (uint8_t i = 0; i < USBH_POLL_MAX_SLOTS; i++) {
         if (g_slots[i].state != POLL_FREE) {
-            USB_LOG_INFO("[slot%u] path=%u-%u-%u addr=%u vid=%04x pid=%04x rx=%lu nak=%lu err=%lu err_streak=%lu max_us=%lu urbto=%lu evt_drop=%lu\r\n",
-                         i, g_slots[i].path[0], g_slots[i].path[1], g_slots[i].path[2],
-                         g_slots[i].dev_addr, g_slots[i].vid, g_slots[i].pid,
-                         (unsigned long)g_slots[i].rx_packets,
-                         (unsigned long)g_slots[i].nak_count,
-                         (unsigned long)g_slots[i].err_count,
-                         (unsigned long)g_slots[i].err_streak,
-                         (unsigned long)g_slots[i].max_us,
-                         (unsigned long)g_slots[i].timeout_count,
-                         (unsigned long)g_slots[i].evt_drop);
+            if (g_dwt_ok) {
+                USB_LOG_INFO("[slot%u] path=%u-%u-%u addr=%u vid=%04x pid=%04x rx=%lu nak=%lu err=%lu err_streak=%lu max_us=%lu urbto=%lu evt_drop=%lu\r\n",
+                             i, g_slots[i].path[0], g_slots[i].path[1], g_slots[i].path[2],
+                             g_slots[i].dev_addr, g_slots[i].vid, g_slots[i].pid,
+                             (unsigned long)g_slots[i].rx_packets,
+                             (unsigned long)g_slots[i].nak_count,
+                             (unsigned long)g_slots[i].err_count,
+                             (unsigned long)g_slots[i].err_streak,
+                             (unsigned long)g_slots[i].max_us,
+                             (unsigned long)g_slots[i].timeout_count,
+                             (unsigned long)g_slots[i].evt_drop);
+            } else {
+                USB_LOG_INFO("[slot%u] path=%u-%u-%u addr=%u vid=%04x pid=%04x rx=%lu nak=%lu err=%lu err_streak=%lu max_us=na urbto=%lu evt_drop=%lu\r\n",
+                             i, g_slots[i].path[0], g_slots[i].path[1], g_slots[i].path[2],
+                             g_slots[i].dev_addr, g_slots[i].vid, g_slots[i].pid,
+                             (unsigned long)g_slots[i].rx_packets,
+                             (unsigned long)g_slots[i].nak_count,
+                             (unsigned long)g_slots[i].err_count,
+                             (unsigned long)g_slots[i].err_streak,
+                             (unsigned long)g_slots[i].timeout_count,
+                             (unsigned long)g_slots[i].evt_drop);
+            }
         }
     }
 }

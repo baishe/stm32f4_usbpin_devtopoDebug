@@ -1180,11 +1180,8 @@ static void dwc2_inchan_irq_handler(struct usbh_bus *bus, uint8_t ch_num)
 
     if (chan_intstatus & USB_OTG_HCINT_CHH) {
         USB_OTG_HC(ch_num)->HCINT = chan_intstatus;
-        if (chan->poll_oneshot && chan->nak_pending) {
+        if (chan_intstatus & USB_OTG_HCINT_XFRC) {
             chan->nak_pending = false;
-            urb->errorcode = -USB_ERR_NAK;
-            dwc2_urb_waitup(urb);
-        } else if (chan_intstatus & USB_OTG_HCINT_XFRC) {
             uint32_t count = chan->xferlen - (USB_OTG_HC(ch_num)->HCTSIZ & USB_OTG_HCTSIZ_XFRSIZ); /* how many size has received */
             uint8_t data_toggle = ((USB_OTG_HC(ch_num)->HCTSIZ & USB_OTG_HCTSIZ_DPID) >> USB_OTG_HCTSIZ_DPID_Pos);
 
@@ -1225,6 +1222,10 @@ static void dwc2_inchan_irq_handler(struct usbh_bus *bus, uint8_t ch_num)
                     dwc2_urb_waitup(urb);
                 }
             }
+        } else if (chan->poll_oneshot && chan->nak_pending) {
+            chan->nak_pending = false;
+            urb->errorcode = -USB_ERR_NAK;
+            dwc2_urb_waitup(urb);
         } else if (chan_intstatus & USB_OTG_HCINT_AHBERR) {
             urb->errorcode = -USB_ERR_IO;
             dwc2_urb_waitup(urb);
