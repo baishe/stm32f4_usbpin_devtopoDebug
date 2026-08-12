@@ -168,6 +168,9 @@ void usb_log_write(const char *fmt, ...);
 #ifndef USBH_POLL_DEBUG_PIN_SELFTEST_ONLY
 #define USBH_POLL_DEBUG_PIN_SELFTEST_ONLY   1        // Toggle debug pin only during selftest
 #endif
+#ifndef USBH_POLL_SELFTEST_VERBOSE
+#define USBH_POLL_SELFTEST_VERBOSE          0        // Enable verbose selftest samples
+#endif
 
 //#define CONFIG_USBHOST_MAX_WINUSB_CLASS     2
 //#define CONFIG_USBHOST_MAX_SERIAL_CLASS  4
