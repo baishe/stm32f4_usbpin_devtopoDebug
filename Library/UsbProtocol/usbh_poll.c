@@ -100,7 +100,6 @@ static bool poll_dwt_enable(void)
 
     for (attempt = 0; attempt < 3; attempt++) {
         CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-        DWT->LAR = 0xC5ACCE55U;
         DWT->CYCCNT = 0;
         DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
         before = DWT->CYCCNT;
