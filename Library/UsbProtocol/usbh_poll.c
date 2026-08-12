@@ -528,7 +528,8 @@ static void poll_task(void *arg)
     TickType_t wake = xTaskGetTickCount();
     (void)arg;
     for (;;) {
-        vTaskDelayUntil(&wake, pdMS_TO_TICKS(USBH_POLL_PERIOD_MS));
+        /* DelayUntil is disabled in CubeMX FreeRTOSConfig; phase drift is acceptable here. */
+        vTaskDelay(pdMS_TO_TICKS(USBH_POLL_PERIOD_MS));
         poll_watchdog();
         poll_drain_reports();
         if (g_selftest_state == USBH_POLL_SELFTEST_RUNNING) {
@@ -625,6 +626,35 @@ int usbh_poll_register(struct usbh_winusb *winusb)
                      (unsigned)(s - g_slots), USBH_POLL_SELFTEST_COUNT);
     }
     return (int)(s - g_slots);
+}
+
+int usbh_poll_first_slot(void)
+{
+    size_t flags;
+    uint8_t i;
+    int slot = -1;
+    poll_critical_enter(&flags);
+    for (i = 0; i < USBH_POLL_MAX_SLOTS; i++) {
+        if (g_slots[i].state != POLL_FREE && g_slots[i].winusb != NULL) {
+            slot = i;
+            break;
+        }
+    }
+    poll_critical_leave(flags);
+    return slot;
+}
+
+struct usbh_winusb *usbh_poll_get_device(uint8_t slot)
+{
+    size_t flags;
+    struct usbh_winusb *winusb = NULL;
+    if (slot >= USBH_POLL_MAX_SLOTS) return NULL;
+    poll_critical_enter(&flags);
+    if (g_slots[slot].state != POLL_FREE && g_slots[slot].winusb != NULL) {
+        winusb = g_slots[slot].winusb;
+    }
+    poll_critical_leave(flags);
+    return winusb;
 }
 
 void usbh_poll_unregister(struct usbh_winusb *winusb)

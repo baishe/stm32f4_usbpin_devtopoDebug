@@ -41,9 +41,10 @@
 
 
 #include "usbh_winusb.h"
+#include "usbh_poll.h"
 /* ���� usbd_init.c �ķ���æ��־ */
 extern volatile uint8_t ep_tx_busy_flag;
-extern struct usbh_winusb *winusb;
+
 
 
 /* ����������ת������ */
@@ -60,8 +61,13 @@ void UartToUsbTask(void const * argument)
             osDelay(1);
         }
         
-        if(winusb != NULL) {
-            usbh_winusb_write(winusb, uart_rx_buffer, uart_rx_len);
+        {
+            int slot = usbh_poll_first_slot();
+            struct usbh_winusb *target = slot < 0 ? NULL :
+                usbh_poll_get_device((uint8_t)slot);
+            if (target != NULL) {
+                usbh_winusb_write(target, uart_rx_buffer, uart_rx_len);
+            }
         }
 
         /* ������֡���ݣ����Զ��ְ��� */

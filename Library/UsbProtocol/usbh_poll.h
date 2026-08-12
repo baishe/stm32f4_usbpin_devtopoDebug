@@ -46,6 +46,8 @@ struct usbh_poll_devinfo {
 
 void usbh_poll_init(void);
 int usbh_poll_register(struct usbh_winusb *winusb);
+int usbh_poll_first_slot(void);
+struct usbh_winusb *usbh_poll_get_device(uint8_t slot);
 void usbh_poll_unregister(struct usbh_winusb *winusb);
 int usbh_poll_enable(uint8_t slot);
 int usbh_poll_disable(uint8_t slot);
