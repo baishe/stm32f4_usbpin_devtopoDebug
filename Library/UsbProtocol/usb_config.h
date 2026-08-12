@@ -152,18 +152,21 @@ void usb_log_write(const char *fmt, ...);
 
 /* ================ USB HOST Stack Configuration ================== */
 
-#define CONFIG_USBHOST_MAX_RHPORTS          1       // host ï¿½ï¿½ï¿½ï¿½
-#define CONFIG_USBHOST_MAX_EXTHUBS          3       // hubï¿½ï¿½ï¿½ï¿½ï¿½ï¿½,ï¿½ï¿½ï¿½Û´ï¿½ï¿½ï¿½
-#define CONFIG_USBHOST_MAX_EHPORTS          7
-#define CONFIG_USBHOST_MAX_INTERFACES       8       // ï¿½ï¿½ï¿½ï¿½ï¿½è±¸ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä½Ó¿ï¿½ï¿½ï¿½ï¿½ï¿½(ï¿½ï¿½ï¿½ï¿½Ç¼ï¿½ï¿½ï¿½ï¿½Ç¾ï¿½ï¿½ï¿½2ï¿½ï¿½)
-#define CONFIG_USBHOST_MAX_INTF_ALTSETTINGS 2       // ï¿½ï¿½ï¿½ï¿½ï¿½è±¸ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
-#define CONFIG_USBHOST_MAX_ENDPOINTS        4       // ï¿½ï¿½ï¿½ï¿½ï¿½è±¸Ã¶ï¿½Ù¶Ë¿Úµï¿½ï¿½ï¿½nï¿½ï¿½ï¿½ï¿½Ê¶ï¿½ï¿½
+#define CONFIG_USBHOST_MAX_RHPORTS          1       // host ÊýÁ¿
+#define CONFIG_USBHOST_MAX_EXTHUBS          3       // hubµÄÊýÁ¿,ÎÞÂÛ´®²¢
+#define CONFIG_USBHOST_MAX_EHPORTS          7       // hubµÄÏÂÐÐ¶Ë¿Ú×î´óÊýÁ¿
+#define CONFIG_USBHOST_MAX_INTERFACES       8       // µ¥¸öÉè±¸Àï×î¶à°üº¬µÄ½Ó¿ÚÊýÁ¿(Èç¹ûÊÇ¼üÊóÄÇ¾ÍÊÇ2¸ö)
+#define CONFIG_USBHOST_MAX_INTF_ALTSETTINGS 2       // µ¥¸öÉè±¸µÄ×î´ó±¸ÓÃÉèÖÃÊý
+#define CONFIG_USBHOST_MAX_ENDPOINTS        4       // µ¥¸öÉè±¸Ã¶¾Ù¶Ë¿ÚµÍÓÚn¸ö²ÅÊ¶±ð
 
 #define CONFIG_USBHOST_MAX_WINUSB_CLASS     20       // Maximum WinUSB devices
 #define CONFIG_USB_DWC2_POLL_CHANNELS      3        // Reserved oneshot polling channels
 #define USBH_URB_FLAG_POLL_ONESHOT         (1 << 0) // One-shot polling URB
 #ifndef USBH_POLL_FULL_HEXDUMP
 #define USBH_POLL_FULL_HEXDUMP              0        // Enable full DATA hexdump
+#endif
+#ifndef USBH_POLL_DEBUG_PIN_SELFTEST_ONLY
+#define USBH_POLL_DEBUG_PIN_SELFTEST_ONLY   1        // Toggle debug pin only during selftest
 #endif
 
 //#define CONFIG_USBHOST_MAX_WINUSB_CLASS     2
