@@ -670,6 +670,16 @@
               <FileType>1</FileType>
               <FilePath>..\Library\UsbProtocol\usbh_winusb.c</FilePath>
             </File>
+            <File>
+              <FileName>usbh_poll.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Library\UsbProtocol\usbh_poll.c</FilePath>
+            </File>
+            <File>
+              <FileName>usbh_poll.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Library\UsbProtocol\usbh_poll.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
