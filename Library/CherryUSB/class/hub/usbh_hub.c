@@ -469,6 +469,7 @@ static int usbh_hub_connect(struct usbh_hubport *hport, uint8_t intf)
         USB_LOG_DBG("port %u, status:0x%03x, change:0x%02x\r\n", port + 1, port_status.wPortStatus, port_status.wPortChange);
         if (port_status.wPortStatus & HUB_PORT_STATUS_CONNECTION) {
             initial_port_mask |= (uint16_t)(1U << (port + 1));
+            USB_LOG_INFO("Hub %u initial scan: port %u connected, scheduling enumeration\r\n", hub->index, port + 1);
         }
     }
 
@@ -608,6 +609,9 @@ static void usbh_hub_events(struct usbh_hub *hub)
                        !hub->child[port].connected;
         if (rescan_retry && hub->enum_fail_count[port] >= 3) {
             continue;
+        }
+        if (rescan_retry) {
+            USB_LOG_INFO("Hub %u rescan: scheduling port %u enumeration\r\n", hub->index, port + 1);
         }
         if (port_needs_handling) {
             uint16_t connection = 0;
