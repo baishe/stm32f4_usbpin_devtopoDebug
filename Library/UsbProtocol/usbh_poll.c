@@ -254,6 +254,8 @@ static void poll_error_recover(struct poll_slot *s)
     size_t flags;
     uint16_t count = 0;
     int16_t errorcode = 0;
+    /* Fast path: the common NAK completion must not pay for a critical section. */
+    if (s->err_streak == 0 && s->next_poll_round == 0) return;
     poll_critical_enter(&flags);
     if (s->err_streak > 1U) {
         count = poll_error_count(s);
