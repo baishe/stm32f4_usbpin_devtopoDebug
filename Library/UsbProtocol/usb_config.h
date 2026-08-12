@@ -13,7 +13,9 @@
 
 #define CONFIG_USB_PRINTF(...) //rt_kprintf(__VA_ARGS__)
 #else
-#define CONFIG_USB_PRINTF(...) printf(__VA_ARGS__)
+
+void usb_log_write(const char *fmt, ...);
+#define CONFIG_USB_PRINTF(...) usb_log_write(__VA_ARGS__)
 #endif
 
 #ifndef CONFIG_USB_DBG_LEVEL
