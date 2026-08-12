@@ -34,6 +34,7 @@ struct poll_slot {
     struct usbh_urb urb;
     uint8_t *buf;
     uint32_t start_cyc;
+    TickType_t start_tick;
     uint8_t dev_addr;
     uint8_t hub_addr;
     uint8_t hub_port;
@@ -83,6 +84,7 @@ static volatile uint8_t g_selftest_slot = 0xff;
 static volatile bool g_selftest_reported;
 static volatile uint16_t g_selftest_n;
 static volatile uint32_t g_selftest_start_cyc;
+static volatile TickType_t g_selftest_start_tick;
 static struct poll_selftest_sample g_selftest_samples[USBH_POLL_SELFTEST_COUNT];
 
 static uint32_t poll_cycles(void)
@@ -306,6 +308,7 @@ static bool poll_submit_claimed(struct poll_slot *s)
     s->urb.transfer_flags = USBH_URB_FLAG_POLL_ONESHOT;
     s->urb.arg = s;
     s->start_cyc = poll_cycles();
+    s->start_tick = xTaskGetTickCount();
     poll_debug_pin(s, GPIO_PIN_SET);
     ret = usbh_submit_urb(&s->urb);
     if (ret < 0) {
@@ -580,14 +583,19 @@ static void poll_complete(void *arg, int nbytes)
 static void poll_watchdog(void)
 {
     uint32_t now = poll_cycles();
+    TickType_t now_tick = xTaskGetTickCount();
     uint8_t i;
-    if (!g_dwt_ok) return;
     for (i = 0; i < USBH_POLL_MAX_SLOTS; i++) {
         struct poll_slot *s = &g_slots[i];
         size_t flags;
         poll_critical_enter(&flags);
         if (s->state == POLL_INFLIGHT &&
-            poll_cycles_to_us((uint32_t)(now - s->start_cyc)) >= USBH_POLL_URB_TIMEOUT_MS * 1000U) {
+            ((g_dwt_ok &&
+              poll_cycles_to_us((uint32_t)(now - s->start_cyc)) >=
+                  USBH_POLL_URB_TIMEOUT_MS * 1000U) ||
+             (!g_dwt_ok &&
+              (TickType_t)(now_tick - s->start_tick) >=
+                  pdMS_TO_TICKS(USBH_POLL_URB_TIMEOUT_MS)))) {
             s->timeout_pending = true;
             usbh_kill_urb(&s->urb);
         }
@@ -639,8 +647,13 @@ static void poll_task(void *arg)
         poll_watchdog();
         poll_drain_reports();
         if (g_selftest_state == USBH_POLL_SELFTEST_RUNNING) {
-            if (g_dwt_ok &&
-                poll_cycles_to_us((uint32_t)(poll_cycles() - g_selftest_start_cyc)) >= 2000000U) {
+            TickType_t now_tick = xTaskGetTickCount();
+            if ((g_dwt_ok &&
+                 poll_cycles_to_us((uint32_t)(poll_cycles() -
+                                               g_selftest_start_cyc)) >= 2000000U) ||
+                (!g_dwt_ok &&
+                 (TickType_t)(now_tick - g_selftest_start_tick) >=
+                     pdMS_TO_TICKS(2000U))) {
                 if (g_selftest_slot < USBH_POLL_MAX_SLOTS) {
                     struct poll_slot *selftest_slot = &g_slots[g_selftest_slot];
                     size_t flags;
@@ -728,6 +741,7 @@ int usbh_poll_register(struct usbh_winusb *winusb)
         g_selftest_reported = false;
         g_selftest_n = 0;
         g_selftest_start_cyc = poll_cycles();
+        g_selftest_start_tick = xTaskGetTickCount();
         s->selftest = true;
         s->selftest_count = 0;
         USB_LOG_INFO("[selftest] start slot=%u count=%u\r\n",
