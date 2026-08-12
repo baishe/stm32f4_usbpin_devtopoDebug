@@ -721,6 +721,7 @@ int usbh_poll_register(struct usbh_winusb *winusb)
     }
     if (!s) return -USB_ERR_NOMEM;
     memset(s, 0, sizeof(*s));
+    s->urb.data_toggle = 0;
     memcpy(s->path, path, sizeof(path));
     s->state = POLL_IDLE;
     s->in_queue = true;
