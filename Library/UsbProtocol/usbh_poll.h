@@ -55,6 +55,6 @@ int usbh_poll_event_recv(struct usbh_poll_event *ev, uint32_t timeout_ms);
 void usbh_poll_buf_release(uint8_t *buf);
 void usbh_poll_stats_dump(void);
 
-__attribute__((weak)) void usbh_poll_on_event(const struct usbh_poll_event *ev);
+void usbh_poll_on_event(const struct usbh_poll_event *ev);
 
 #endif

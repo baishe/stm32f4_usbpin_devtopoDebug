@@ -6,8 +6,26 @@
 #include "task.h"
 #include "usb_log.h"
 #include <string.h>
+#include <stdio.h>
 
 #define WINUSB_PRODUCT_STRING_KEYWORD  "WINUSB DEMO"
+
+#if USBH_POLL_FULL_HEXDUMP
+static void poll_hexdump(const uint8_t *data, uint16_t len)
+{
+    char line[49];
+    uint16_t off;
+    for (off = 0; off < len; off += 16) {
+        uint16_t n = len - off > 16 ? 16 : len - off;
+        uint16_t i;
+        for (i = 0; i < n; i++) {
+            snprintf(&line[i * 3], sizeof(line) - i * 3, "%02x ", data[off + i]);
+        }
+        line[n * 3] = 0;
+        USB_LOG_INFO("[poll] dump+%u %s\r\n", off, line);
+    }
+}
+#endif
 
 
 
@@ -66,23 +84,38 @@ int usbh_winusb_check(struct usbh_hubport *hport)
 /* -------------------------------------------------------------------------- */
 void dummy_event_handler(uint8_t busid, uint8_t hub_index, uint8_t hub_port, uint8_t intf, uint8_t event)
 {
-    (void)busid; (void)hub_index; (void)hub_port; (void)intf; (void)event;
+    switch (event) {
+    case USBH_EVENT_INTERFACE_UNSUPPORTED:
+    case USBH_EVENT_INTERFACE_START:
+        CONFIG_USB_PRINTF("hub_index: %d, hub_port: %d, intf: %d, event type: %d\n",
+                          hub_index, hub_port, intf, event);
+        break;
+    case USBH_EVENT_INTERFACE_STOP:
+        break;
+    default:
+        break;
+    }
 }
 
 static void UsbEventTask(void *arg)
 {
     struct usbh_poll_event ev;
+    char hex[24];
+    uint8_t i;
     (void)arg;
     for (;;) {
         if (usbh_poll_event_recv(&ev, portMAX_DELAY) == 0) {
             usbh_poll_on_event(&ev);
             if (ev.type == USBH_POLL_EVENT_DATA) {
-                USB_LOG_INFO("[poll] slot=%u path=%u-%u-%u len=%u data=%02x %02x %02x %02x %02x %02x %02x %02x\r\n",
-                    ev.slot, ev.path[0], ev.path[1], ev.path[2], ev.len,
-                    ev.len > 0 ? ev.data[0] : 0, ev.len > 1 ? ev.data[1] : 0,
-                    ev.len > 2 ? ev.data[2] : 0, ev.len > 3 ? ev.data[3] : 0,
-                    ev.len > 4 ? ev.data[4] : 0, ev.len > 5 ? ev.data[5] : 0,
-                    ev.len > 6 ? ev.data[6] : 0, ev.len > 7 ? ev.data[7] : 0);
+                hex[0] = 0;
+                for (i = 0; i < ev.len && i < 8; i++) {
+                    snprintf(&hex[i * 3], sizeof(hex) - i * 3, "%02x ", ev.data[i]);
+                }
+                USB_LOG_INFO("[poll] slot=%u path=%u-%u-%u len=%u data=%s\r\n",
+                             ev.slot, ev.path[0], ev.path[1], ev.path[2], ev.len, hex);
+#if USBH_POLL_FULL_HEXDUMP
+                poll_hexdump(ev.data, ev.len);
+#endif
                 usbh_poll_buf_release(ev.data);
             } else if (ev.type == USBH_POLL_EVENT_ERROR) {
                 USB_LOG_ERR("[poll] slot=%u error=%d\r\n", ev.slot, ev.errorcode);
@@ -104,10 +137,10 @@ static void UsbStatsTask(void *arg)
 
 void usbh_init(void)
 {
-    usbh_initialize(0, USB_OTG_HS_PERIPH_BASE, dummy_event_handler);
     usbh_poll_init();
-    if (xTaskCreate(UsbEventTask, "UsbEvent", 512, NULL, tskIDLE_PRIORITY + 3, NULL) != pdPASS ||
-        xTaskCreate(UsbStatsTask, "UsbStats", 384, NULL, tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
+    usbh_initialize(0, USB_OTG_HS_PERIPH_BASE, dummy_event_handler);
+    if (xTaskCreate(UsbEventTask, "UsbEvent", 320, NULL, tskIDLE_PRIORITY + 3, NULL) != pdPASS ||
+        xTaskCreate(UsbStatsTask, "UsbStats", 256, NULL, tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
         Error_Handler();
     }
 }

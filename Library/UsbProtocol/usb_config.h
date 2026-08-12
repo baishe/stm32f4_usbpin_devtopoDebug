@@ -155,12 +155,16 @@ void usb_log_write(const char *fmt, ...);
 #define CONFIG_USBHOST_MAX_RHPORTS          1       // host ����
 #define CONFIG_USBHOST_MAX_EXTHUBS          3       // hub������,���۴���
 #define CONFIG_USBHOST_MAX_EHPORTS          7
-#define CONFIG_USBHOST_MAX_WINUSB_CLASS     20
-#define CONFIG_USB_DWC2_POLL_CHANNELS      3
-#define USBH_URB_FLAG_POLL_ONESHOT         (1 << 0)
 #define CONFIG_USBHOST_MAX_INTERFACES       8       // �����豸���������Ľӿ�����(����Ǽ����Ǿ���2��)
 #define CONFIG_USBHOST_MAX_INTF_ALTSETTINGS 2       // �����豸�������������
 #define CONFIG_USBHOST_MAX_ENDPOINTS        4       // �����豸ö�ٶ˿ڵ���n����ʶ��
+
+#define CONFIG_USBHOST_MAX_WINUSB_CLASS     20       // Maximum WinUSB devices
+#define CONFIG_USB_DWC2_POLL_CHANNELS      3        // Reserved oneshot polling channels
+#define USBH_URB_FLAG_POLL_ONESHOT         (1 << 0) // One-shot polling URB
+#ifndef USBH_POLL_FULL_HEXDUMP
+#define USBH_POLL_FULL_HEXDUMP              0        // Enable full DATA hexdump
+#endif
 
 //#define CONFIG_USBHOST_MAX_WINUSB_CLASS     2
 //#define CONFIG_USBHOST_MAX_SERIAL_CLASS  4

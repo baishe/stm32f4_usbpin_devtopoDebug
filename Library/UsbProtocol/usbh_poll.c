@@ -2,17 +2,34 @@
 #include "usbh_poll.h"
 #include "usbh_core.h"
 #include "usb_log.h"
+#include "usb_osal.h"
 #include "task.h"
 #include <string.h>
+
+#define POLL_FREE 0
+#define POLL_IDLE 1
+#define POLL_INFLIGHT 2
+#define USBH_POLL_URB_TIMEOUT_MS 5
+#define USBH_POLL_SELFTEST_IDLE 0
+#define USBH_POLL_SELFTEST_RUNNING 1
+#define USBH_POLL_SELFTEST_DONE 2
+
+struct poll_selftest_sample {
+    uint16_t us;
+    int8_t rc;
+};
 
 struct poll_slot {
     volatile uint8_t state;
     bool in_queue;
+    bool selftest;
+    bool timeout_pending;
     struct usbh_winusb *winusb;
     struct usbh_hubport *hport;
     struct usb_endpoint_descriptor *bulkin;
     struct usbh_urb urb;
     uint8_t *buf;
+    uint32_t start_cyc;
     uint8_t dev_addr;
     uint8_t hub_addr;
     uint8_t hub_port;
@@ -23,18 +40,11 @@ struct poll_slot {
     uint32_t rx_packets;
     uint32_t nak_count;
     uint32_t err_count;
+    uint32_t timeout_count;
     uint32_t last_us;
     uint32_t max_us;
-    uint32_t selftest_left;
-    bool selftest;
-    uint32_t selftest_min;
-    uint32_t selftest_max;
-    uint64_t selftest_sum;
+    uint16_t selftest_count;
 };
-
-#define POLL_FREE 0
-#define POLL_IDLE 1
-#define POLL_INFLIGHT 2
 
 static struct poll_slot g_slots[USBH_POLL_MAX_SLOTS];
 static uint8_t g_buffers[USBH_POLL_BUF_NUM][USBH_POLL_BUF_SIZE] USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX;
@@ -43,74 +53,103 @@ static QueueHandle_t g_event_queue;
 static TaskHandle_t g_poll_task;
 static volatile uint32_t g_round;
 static volatile uint32_t g_overrun;
-static volatile uint32_t g_scan;
+static volatile uint32_t g_round_scan;
+static volatile uint32_t g_scan_snapshot;
+static volatile uint8_t g_cursor;
+static volatile uint8_t g_inflight;
+static volatile bool g_round_active;
+static volatile bool g_pool_blocked;
 static volatile uint32_t g_busy_min = 0xffffffffU;
 static volatile uint32_t g_busy_max;
 static volatile uint64_t g_busy_sum;
 static volatile uint32_t g_busy_count;
-static volatile uint32_t g_pool_low;
+static volatile uint32_t g_pool_empty;
 static volatile uint32_t g_evtq_high;
-static volatile bool g_pool_blocked;
-static uint8_t g_next_slot;
+static volatile uint32_t g_timeout_count;
+static volatile uint8_t g_selftest_state = USBH_POLL_SELFTEST_IDLE;
+static volatile uint8_t g_selftest_slot = 0xff;
+static volatile bool g_selftest_reported;
+static struct poll_selftest_sample g_selftest_samples[USBH_POLL_SELFTEST_COUNT];
 
-static uint32_t poll_now_us(void)
+static uint32_t poll_cycles(void)
 {
-    return (uint32_t)(DWT->CYCCNT / (SystemCoreClock / 1000000U));
+    return DWT->CYCCNT;
+}
+
+static uint32_t poll_cycles_to_us(uint32_t cycles)
+{
+    return cycles / (SystemCoreClock / 1000000U);
+}
+
+static void poll_critical_enter(size_t *flags)
+{
+    *flags = usb_osal_enter_critical_section();
+}
+
+static void poll_critical_leave(size_t flags)
+{
+    usb_osal_leave_critical_section(flags);
 }
 
 static int poll_buf_alloc(uint8_t **buf)
 {
-    UBaseType_t key = taskENTER_CRITICAL_FROM_ISR();
+    size_t flags;
     int i;
+    poll_critical_enter(&flags);
     for (i = 0; i < USBH_POLL_BUF_NUM; i++) {
         if (!g_buf_used[i]) {
             g_buf_used[i] = true;
             *buf = g_buffers[i];
-            taskEXIT_CRITICAL_FROM_ISR(key);
+            poll_critical_leave(flags);
             return 0;
         }
     }
-    taskEXIT_CRITICAL_FROM_ISR(key);
-    g_pool_low++;
+    poll_critical_leave(flags);
+    g_pool_empty++;
     g_pool_blocked = true;
     return -1;
 }
 
 void usbh_poll_buf_release(uint8_t *buf)
 {
+    size_t flags;
     int i;
-    if (!buf) {
-        return;
-    }
+    if (!buf) return;
+    poll_critical_enter(&flags);
     for (i = 0; i < USBH_POLL_BUF_NUM; i++) {
         if (buf == g_buffers[i]) {
-            taskENTER_CRITICAL();
             g_buf_used[i] = false;
-            taskEXIT_CRITICAL();
-            return;
+            break;
         }
     }
+    poll_critical_leave(flags);
 }
 
 static void poll_path(struct usbh_hubport *hport, uint8_t *path)
 {
-    uint8_t rev[4] = {0};
+    uint8_t reverse[4] = { 0 };
     uint8_t n = 0;
     struct usbh_hubport *p = hport;
     while (p && n < 4) {
-        rev[n++] = p->port;
-        p = p->parent ? p->parent->parent : NULL;
+        reverse[n++] = p->port;
+        if (!p->parent) break;
+        p = p->parent->parent;
     }
-    while (n) {
-        *path++ = rev[--n];
-    }
+    while (n) *path++ = reverse[--n];
 }
 
-static void poll_event(struct poll_slot *s, uint8_t type, uint8_t *data,
+static bool poll_same_path(const struct poll_slot *s, const uint8_t *path, uint8_t depth)
+{
+    return s->depth == depth && memcmp(s->path, path, 4) == 0;
+}
+
+static bool poll_event(struct poll_slot *s, uint8_t type, uint8_t *data,
                        uint16_t len, int errorcode)
 {
     struct usbh_poll_event ev;
     BaseType_t woken = pdFALSE;
+    UBaseType_t high;
+    bool in_isr = xPortIsInsideInterrupt() != pdFALSE;
     memset(&ev, 0, sizeof(ev));
     ev.type = type;
     ev.slot = (uint8_t)(s - g_slots);
@@ -122,118 +161,195 @@ static void poll_event(struct poll_slot *s, uint8_t type, uint8_t *data,
     ev.data = data;
     ev.len = len;
     ev.errorcode = (int16_t)errorcode;
-    if (xPortIsInsideInterrupt()) {
-        xQueueSendFromISR(g_event_queue, &ev, &woken);
+    if (in_isr) {
+        if (xQueueSendFromISR(g_event_queue, &ev, &woken) != pdTRUE) return false;
+        high = uxQueueMessagesWaitingFromISR(g_event_queue);
         portYIELD_FROM_ISR(woken);
     } else {
-        xQueueSend(g_event_queue, &ev, 0);
+        if (xQueueSend(g_event_queue, &ev, 0) != pdTRUE) return false;
+        high = uxQueueMessagesWaiting(g_event_queue);
     }
-    {
-        UBaseType_t high = uxQueueMessagesWaitingFromISR(g_event_queue);
-        if (high > g_evtq_high) {
-            g_evtq_high = high;
-        }
-    }
+    if (high > g_evtq_high) g_evtq_high = high;
+    return true;
 }
 
-static void poll_submit(struct poll_slot *s)
+static void poll_complete(void *arg, int nbytes);
+static void poll_pump(void);
+
+static bool poll_submit(struct poll_slot *s)
 {
     uint8_t *buf;
     int ret;
-    if (!s->in_queue || s->state != POLL_IDLE || !s->bulkin || g_pool_blocked) {
-        return;
-    }
-    if (poll_buf_alloc(&buf) != 0) {
-        return;
-    }
+    bool selftest = s->selftest;
+    if (!s->in_queue || s->state != POLL_IDLE || !s->bulkin) return false;
+    if (!selftest && g_pool_blocked) return false;
+    if (poll_buf_alloc(&buf) != 0) return false;
     s->buf = buf;
     usbh_bulk_urb_fill(&s->urb, s->hport, s->bulkin, buf,
-                       USBH_POLL_BUF_SIZE, 0, NULL, s);
+                       USBH_POLL_BUF_SIZE, 0, poll_complete, s);
     s->urb.transfer_flags = USBH_URB_FLAG_POLL_ONESHOT;
     s->urb.arg = s;
+    s->start_cyc = poll_cycles();
     s->state = POLL_INFLIGHT;
-    s->urb.start_frame = poll_now_us();
+    g_inflight++;
     HAL_GPIO_WritePin(DEBUG_IO_GPIO_Port, DEBUG_IO_Pin, GPIO_PIN_SET);
     ret = usbh_submit_urb(&s->urb);
     if (ret < 0) {
+        HAL_GPIO_WritePin(DEBUG_IO_GPIO_Port, DEBUG_IO_Pin, GPIO_PIN_RESET);
         s->state = POLL_IDLE;
+        if (g_inflight) g_inflight--;
         usbh_poll_buf_release(buf);
         s->buf = NULL;
+        return false;
     }
+    return true;
+}
+
+static void poll_pump(void)
+{
+    while (g_round_active && g_inflight < USBH_POLL_CONCURRENCY && g_cursor < USBH_POLL_MAX_SLOTS) {
+        struct poll_slot *s = &g_slots[g_cursor++];
+        if (s->in_queue && s->state == POLL_IDLE && poll_submit(s)) g_round_scan++;
+        if (g_pool_blocked) {
+            g_cursor = USBH_POLL_MAX_SLOTS;
+            break;
+        }
+    }
+    if (g_round_active && g_cursor >= USBH_POLL_MAX_SLOTS && g_inflight == 0) {
+        g_scan_snapshot = g_round_scan;
+        g_round_active = false;
+    }
+}
+
+static void poll_selftest_report(void)
+{
+    uint32_t min = 0xffffffffU, max = 0, sum = 0;
+    uint32_t nak = 0, zero = 0, other = 0;
+    uint32_t bins[5] = { 0 };
+    uint16_t i;
+    if (g_selftest_state != USBH_POLL_SELFTEST_DONE || g_selftest_reported) return;
+    for (i = 0; i < USBH_POLL_SELFTEST_COUNT; i++) {
+        uint32_t us = g_selftest_samples[i].us;
+        int rc = g_selftest_samples[i].rc;
+        if (us < min) min = us;
+        if (us > max) max = us;
+        sum += us;
+        if (rc == -USB_ERR_NAK) nak++;
+        else if (rc == 0) zero++;
+        else other++;
+        if (us < 10) bins[0]++;
+        else if (us < 20) bins[1]++;
+        else if (us < 50) bins[2]++;
+        else if (us < 100) bins[3]++;
+        else bins[4]++;
+    }
+    USB_LOG_INFO("[selftest] count=%u rc(nak/zero/other)=%lu/%lu/%lu us(min/avg/max)=%lu/%lu/%lu\r\n",
+                 USBH_POLL_SELFTEST_COUNT, (unsigned long)nak, (unsigned long)zero,
+                 (unsigned long)other, (unsigned long)min,
+                 (unsigned long)(sum / USBH_POLL_SELFTEST_COUNT), (unsigned long)max);
+    USB_LOG_INFO("[selftest] hist(<10/10-20/20-50/50-100/>100)=%lu/%lu/%lu/%lu/%lu\r\n",
+                 (unsigned long)bins[0], (unsigned long)bins[1], (unsigned long)bins[2],
+                 (unsigned long)bins[3], (unsigned long)bins[4]);
+    for (i = 0; i < 20 && i < USBH_POLL_SELFTEST_COUNT; i++) {
+        USB_LOG_INFO("[selftest] sample[%u] us=%u rc=%d\r\n", i,
+                     g_selftest_samples[i].us, g_selftest_samples[i].rc);
+    }
+    g_selftest_reported = true;
 }
 
 static void poll_complete(void *arg, int nbytes)
 {
     struct poll_slot *s = (struct poll_slot *)arg;
     struct usbh_urb *urb = &s->urb;
-    uint32_t elapsed = poll_now_us() - urb->start_frame;
-    BaseType_t woken = pdFALSE;
+    uint8_t *buf = s->buf;
+    uint32_t elapsed = poll_cycles_to_us((uint32_t)(poll_cycles() - s->start_cyc));
+    bool timeout = s->timeout_pending;
     (void)nbytes;
     HAL_GPIO_WritePin(DEBUG_IO_GPIO_Port, DEBUG_IO_Pin, GPIO_PIN_RESET);
+    if (g_inflight) g_inflight--;
+    s->state = POLL_IDLE;
     s->last_us = elapsed;
     if (elapsed > s->max_us) s->max_us = elapsed;
     if (elapsed < g_busy_min) g_busy_min = elapsed;
     if (elapsed > g_busy_max) g_busy_max = elapsed;
     g_busy_sum += elapsed;
     g_busy_count++;
-    s->state = POLL_IDLE;
+    s->timeout_pending = false;
+
     if (!s->in_queue) {
-        usbh_poll_buf_release(s->buf);
+        usbh_poll_buf_release(buf);
         s->buf = NULL;
         poll_event(s, USBH_POLL_EVENT_DETACH, NULL, 0, 0);
+        s->winusb = NULL;
+        s->hport = NULL;
+        s->bulkin = NULL;
         s->state = POLL_FREE;
+        if (g_selftest_state == USBH_POLL_SELFTEST_RUNNING &&
+            g_selftest_slot == (uint8_t)(s - g_slots)) {
+            g_selftest_state = USBH_POLL_SELFTEST_DONE;
+            g_selftest_slot = 0xff;
+        }
         return;
     }
     if (s->selftest) {
-        uint8_t *completed_buf = s->buf;
-        uint32_t n = USBH_POLL_SELFTEST_COUNT - s->selftest_left;
-        if (elapsed < s->selftest_min) s->selftest_min = elapsed;
-        if (elapsed > s->selftest_max) s->selftest_max = elapsed;
-        s->selftest_sum += elapsed;
-        USB_LOG_INFO("[selftest] n=%lu rc=%d us=%lu\r\n",
-                     (unsigned long)n, urb->errorcode, (unsigned long)elapsed);
-        if (s->selftest_left) {
-            s->selftest_left--;
+        uint16_t n = s->selftest_count;
+        if (n < USBH_POLL_SELFTEST_COUNT) {
+            g_selftest_samples[n].us = elapsed > 0xffffU ? 0xffffU : (uint16_t)elapsed;
+            g_selftest_samples[n].rc = (int8_t)urb->errorcode;
+            s->selftest_count++;
+        }
+        usbh_poll_buf_release(buf);
+        s->buf = NULL;
+        if (s->selftest_count < USBH_POLL_SELFTEST_COUNT) {
             poll_submit(s);
         } else {
-            USB_LOG_INFO("[selftest] done min/avg/max=%lu/%lu/%lu us\r\n",
-                         (unsigned long)s->selftest_min,
-                         (unsigned long)(s->selftest_sum / USBH_POLL_SELFTEST_COUNT),
-                         (unsigned long)s->selftest_max);
             s->selftest = false;
+            g_selftest_state = USBH_POLL_SELFTEST_DONE;
         }
-        usbh_poll_buf_release(completed_buf);
-        if (!s->selftest) s->buf = NULL;
         return;
     }
-    if (urb->errorcode == -USB_ERR_NAK) {
+    if (timeout) {
+        s->timeout_count++;
+        g_timeout_count++;
+        usbh_poll_buf_release(buf);
+        s->buf = NULL;
+        poll_event(s, USBH_POLL_EVENT_ERROR, NULL, 0, -USB_ERR_TIMEOUT);
+    } else if (urb->errorcode == -USB_ERR_NAK) {
         s->nak_count++;
-        usbh_poll_buf_release(s->buf);
+        usbh_poll_buf_release(buf);
+        s->buf = NULL;
     } else if (urb->errorcode == 0 && urb->actual_length > 0) {
         s->rx_packets++;
-        poll_event(s, USBH_POLL_EVENT_DATA, s->buf, (uint16_t)urb->actual_length, 0);
-        s->buf = NULL;
+        if (poll_event(s, USBH_POLL_EVENT_DATA, buf, (uint16_t)urb->actual_length, 0)) {
+            s->buf = NULL;
+        } else {
+            usbh_poll_buf_release(buf);
+            s->buf = NULL;
+        }
     } else if (urb->errorcode == 0) {
-        usbh_poll_buf_release(s->buf);
+        usbh_poll_buf_release(buf);
+        s->buf = NULL;
     } else {
         s->err_count++;
-        usbh_poll_buf_release(s->buf);
+        usbh_poll_buf_release(buf);
+        s->buf = NULL;
         poll_event(s, USBH_POLL_EVENT_ERROR, NULL, 0, urb->errorcode);
     }
-    s->buf = NULL;
-    if (g_next_slot < USBH_POLL_MAX_SLOTS) {
-        uint8_t next = g_next_slot++;
-        if (g_slots[next].in_queue && g_slots[next].state == POLL_IDLE) {
-            poll_submit(&g_slots[next]);
-        }
-    }
-    (void)woken;
+    poll_pump();
 }
 
-static void poll_start(struct poll_slot *s)
+static void poll_watchdog(void)
 {
-    s->urb.complete = poll_complete;
-    poll_submit(s);
+    uint32_t now = poll_cycles();
+    uint8_t i;
+    for (i = 0; i < USBH_POLL_MAX_SLOTS; i++) {
+        struct poll_slot *s = &g_slots[i];
+        if (s->state == POLL_INFLIGHT &&
+            poll_cycles_to_us((uint32_t)(now - s->start_cyc)) >= USBH_POLL_URB_TIMEOUT_MS * 1000U) {
+            s->timeout_pending = true;
+            usbh_kill_urb(&s->urb);
+        }
+    }
 }
 
 static void poll_task(void *arg)
@@ -242,23 +358,23 @@ static void poll_task(void *arg)
     (void)arg;
     for (;;) {
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(USBH_POLL_PERIOD_MS));
-        if (g_next_slot != USBH_POLL_MAX_SLOTS) {
+        poll_watchdog();
+        if (g_selftest_state == USBH_POLL_SELFTEST_RUNNING) {
+            if (g_selftest_slot < USBH_POLL_MAX_SLOTS && g_slots[g_selftest_slot].state == POLL_IDLE)
+                poll_submit(&g_slots[g_selftest_slot]);
+            continue;
+        }
+        if (g_round_active) {
             g_overrun++;
+            poll_pump();
             continue;
         }
         g_round++;
+        g_cursor = 0;
+        g_round_scan = 0;
         g_pool_blocked = false;
-        g_next_slot = 0;
-        g_scan = 0;
-        while (g_next_slot < USBH_POLL_MAX_SLOTS &&
-               g_scan < USBH_POLL_CONCURRENCY) {
-            struct poll_slot *s = &g_slots[g_next_slot++];
-            if (s->in_queue && s->state == POLL_IDLE) {
-                g_scan++;
-                poll_start(s);
-            }
-        }
-        if (g_scan < USBH_POLL_CONCURRENCY) g_next_slot = USBH_POLL_MAX_SLOTS;
+        g_round_active = true;
+        poll_pump();
     }
 }
 
@@ -268,19 +384,30 @@ void usbh_poll_init(void)
     DWT->CYCCNT = 0;
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
     g_event_queue = xQueueCreate(8, sizeof(struct usbh_poll_event));
-    xTaskCreate(poll_task, "UsbPoll", 512, NULL, tskIDLE_PRIORITY + 1, &g_poll_task);
+    xTaskCreate(poll_task, "UsbPoll", 256, NULL, tskIDLE_PRIORITY + 1, &g_poll_task);
 }
 
 int usbh_poll_register(struct usbh_winusb *winusb)
 {
+    uint8_t path[4] = { 0 };
     int i;
     struct poll_slot *s = NULL;
+    if (!winusb || !winusb->hport) return -USB_ERR_INVAL;
+    poll_path(winusb->hport, path);
     for (i = 0; i < USBH_POLL_MAX_SLOTS; i++) {
-        if (g_slots[i].state == POLL_FREE) { s = &g_slots[i]; break; }
-        if (g_slots[i].hport == winusb->hport) { s = &g_slots[i]; break; }
+        if (g_slots[i].state == POLL_FREE && poll_same_path(&g_slots[i], path, winusb->hport->depth)) {
+            s = &g_slots[i];
+            break;
+        }
+    }
+    if (!s) {
+        for (i = 0; i < USBH_POLL_MAX_SLOTS; i++) {
+            if (g_slots[i].state == POLL_FREE) { s = &g_slots[i]; break; }
+        }
     }
     if (!s) return -USB_ERR_NOMEM;
     memset(s, 0, sizeof(*s));
+    memcpy(s->path, path, sizeof(path));
     s->state = POLL_IDLE;
     s->in_queue = true;
     s->winusb = winusb;
@@ -292,12 +419,13 @@ int usbh_poll_register(struct usbh_winusb *winusb)
     s->hub_addr = s->hport->parent ? s->hport->parent->hub_addr : 0;
     s->vid = s->hport->device_desc.idVendor;
     s->pid = s->hport->device_desc.idProduct;
-    poll_path(s->hport, s->path);
     poll_event(s, USBH_POLL_EVENT_ATTACH, NULL, 0, 0);
-    if (g_round == 0) {
+    if (g_selftest_state == USBH_POLL_SELFTEST_IDLE) {
+        g_selftest_state = USBH_POLL_SELFTEST_RUNNING;
+        g_selftest_slot = (uint8_t)(s - g_slots);
+        g_selftest_reported = false;
         s->selftest = true;
-        s->selftest_left = USBH_POLL_SELFTEST_COUNT - 1;
-        s->selftest_min = 0xffffffffU;
+        s->selftest_count = 0;
         USB_LOG_INFO("[selftest] start slot=%u count=%u\r\n",
                      (unsigned)(s - g_slots), USBH_POLL_SELFTEST_COUNT);
     }
@@ -306,13 +434,25 @@ int usbh_poll_register(struct usbh_winusb *winusb)
 
 void usbh_poll_unregister(struct usbh_winusb *winusb)
 {
-    int i;
+    uint8_t i;
     for (i = 0; i < USBH_POLL_MAX_SLOTS; i++) {
-        if (g_slots[i].winusb == winusb) {
-            g_slots[i].in_queue = false;
-            if (g_slots[i].state == POLL_IDLE) {
-                poll_event(&g_slots[i], USBH_POLL_EVENT_DETACH, NULL, 0, 0);
-                g_slots[i].state = POLL_FREE;
+        struct poll_slot *s = &g_slots[i];
+        if (s->winusb == winusb) {
+            s->in_queue = false;
+            if (s->state == POLL_INFLIGHT) {
+                usbh_kill_urb(&s->urb);
+            }
+            if (s->state == POLL_IDLE) {
+                poll_event(s, USBH_POLL_EVENT_DETACH, NULL, 0, 0);
+                s->winusb = NULL;
+                s->hport = NULL;
+                s->bulkin = NULL;
+                s->state = POLL_FREE;
+                if (g_selftest_state == USBH_POLL_SELFTEST_RUNNING &&
+                    g_selftest_slot == i) {
+                    g_selftest_state = USBH_POLL_SELFTEST_DONE;
+                    g_selftest_slot = 0xff;
+                }
             }
             return;
         }
@@ -321,22 +461,28 @@ void usbh_poll_unregister(struct usbh_winusb *winusb)
 
 int usbh_poll_enable(uint8_t slot)
 {
+    size_t flags;
     if (slot >= USBH_POLL_MAX_SLOTS) return -USB_ERR_INVAL;
-    taskENTER_CRITICAL();
+    poll_critical_enter(&flags);
     g_slots[slot].in_queue = true;
-    taskEXIT_CRITICAL();
+    poll_critical_leave(flags);
     return 0;
 }
 
 int usbh_poll_disable(uint8_t slot)
 {
+    size_t flags;
     if (slot >= USBH_POLL_MAX_SLOTS) return -USB_ERR_INVAL;
-    taskENTER_CRITICAL();
+    poll_critical_enter(&flags);
     g_slots[slot].in_queue = false;
-    taskEXIT_CRITICAL();
+    poll_critical_leave(flags);
     return 0;
 }
-bool usbh_poll_is_enabled(uint8_t slot) { return slot < USBH_POLL_MAX_SLOTS && g_slots[slot].in_queue; }
+
+bool usbh_poll_is_enabled(uint8_t slot)
+{
+    return slot < USBH_POLL_MAX_SLOTS && g_slots[slot].in_queue;
+}
 
 int usbh_poll_get_info(uint8_t slot, struct usbh_poll_devinfo *info)
 {
@@ -352,28 +498,35 @@ int usbh_poll_get_info(uint8_t slot, struct usbh_poll_devinfo *info)
 
 int usbh_poll_event_recv(struct usbh_poll_event *ev, uint32_t timeout_ms)
 {
-    return (xQueueReceive(g_event_queue, ev, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) ? 0 : -USB_ERR_TIMEOUT;
+    TickType_t timeout = timeout_ms == 0xffffffffU ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+    return xQueueReceive(g_event_queue, ev, timeout) == pdTRUE ? 0 : -USB_ERR_TIMEOUT;
 }
 
 void usbh_poll_stats_dump(void)
 {
     uint32_t avg = g_busy_count ? (uint32_t)(g_busy_sum / g_busy_count) : 0;
-    USB_LOG_INFO("[poll] round=%lu overrun=%lu scan=%lu busy_us(min/avg/max)=%lu/%lu/%lu pool_low=%lu evtq_high=%lu\r\n",
-                 (unsigned long)g_round, (unsigned long)g_overrun, (unsigned long)g_scan,
+    poll_selftest_report();
+    USB_LOG_INFO("[poll] round=%lu overrun=%lu scan=%lu busy_us(min/avg/max)=%lu/%lu/%lu pool_empty=%lu evtq_high=%lu urbto=%lu\r\n",
+                 (unsigned long)g_round, (unsigned long)g_overrun, (unsigned long)g_scan_snapshot,
                  (unsigned long)(g_busy_min == 0xffffffffU ? 0 : g_busy_min),
                  (unsigned long)avg, (unsigned long)g_busy_max,
-                 (unsigned long)g_pool_low, (unsigned long)g_evtq_high);
+                 (unsigned long)g_pool_empty, (unsigned long)g_evtq_high,
+                 (unsigned long)g_timeout_count);
     for (uint8_t i = 0; i < USBH_POLL_MAX_SLOTS; i++) {
         if (g_slots[i].state != POLL_FREE) {
-            USB_LOG_INFO("[slot%u] path=%u-%u-%u addr=%u vid=%04x pid=%04x rx=%lu nak=%lu err=%lu max_us=%lu\r\n",
+            USB_LOG_INFO("[slot%u] path=%u-%u-%u addr=%u vid=%04x pid=%04x rx=%lu nak=%lu err=%lu max_us=%lu urbto=%lu\r\n",
                          i, g_slots[i].path[0], g_slots[i].path[1], g_slots[i].path[2],
                          g_slots[i].dev_addr, g_slots[i].vid, g_slots[i].pid,
                          (unsigned long)g_slots[i].rx_packets,
                          (unsigned long)g_slots[i].nak_count,
                          (unsigned long)g_slots[i].err_count,
-                         (unsigned long)g_slots[i].max_us);
+                         (unsigned long)g_slots[i].max_us,
+                         (unsigned long)g_slots[i].timeout_count);
         }
     }
 }
 
-__attribute__((weak)) void usbh_poll_on_event(const struct usbh_poll_event *ev) { (void)ev; }
+__attribute__((weak)) void usbh_poll_on_event(const struct usbh_poll_event *ev)
+{
+    (void)ev;
+}
