@@ -127,7 +127,7 @@ volatile bool ep_tx_busy_flag = false;
 static volatile bool usbd_configured_flag = false;
 static uint32_t usbd_send_count = 0;
 
-#define USBD_PERIODIC_TASK_STACK_SIZE 512
+#define USBD_PERIODIC_TASK_STACK_SIZE 256
 #define USBD_PERIODIC_SEND_INTERVAL_MS 1500
 
 static void usbd_event_handler(uint8_t busid, uint8_t event)
