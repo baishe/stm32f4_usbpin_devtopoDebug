@@ -14,6 +14,8 @@
 #define USBH_POLL_SELFTEST_RUNNING 1
 #define USBH_POLL_SELFTEST_DONE 2
 
+extern volatile uint32_t g_dwc2_poll_salvage;
+
 struct poll_selftest_sample {
     uint16_t us_x10;
     int8_t rc;
@@ -880,10 +882,11 @@ void usbh_poll_stats_dump(void)
     g_busy_count = 0;
     poll_critical_leave(flags);
     poll_selftest_report();
-    USB_LOG_INFO("[poll] round=%lu scan=%lu overrun=%lu urbto=%lu evt_drop=%lu\r\n",
+    USB_LOG_INFO("[poll] round=%lu scan=%lu overrun=%lu urbto=%lu evt_drop=%lu salvage=%lu\r\n",
                  (unsigned long)g_round, (unsigned long)g_scan_snapshot,
                  (unsigned long)g_overrun, (unsigned long)g_timeout_count,
-                 (unsigned long)evt_drop);
+                 (unsigned long)evt_drop,
+                 (unsigned long)g_dwc2_poll_salvage);
     for (uint8_t i = 0; i < USBH_POLL_MAX_SLOTS; i++) {
         if (g_slots[i].state != POLL_FREE) {
             TickType_t base_tick = g_slots[i].rx_packets != 0 ?

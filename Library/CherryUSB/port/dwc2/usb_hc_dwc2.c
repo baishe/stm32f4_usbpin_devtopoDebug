@@ -40,6 +40,7 @@ struct dwc2_hcd {
     struct dwc2_user_params user_params;
     struct dwc2_chan chan_pool[16];
 } g_dwc2_hcd[CONFIG_USBHOST_MAX_BUS];
+volatile uint32_t g_dwc2_poll_salvage;
 
 #define DWC2_EP0_STATE_SETUP     0
 #define DWC2_EP0_STATE_INDATA    1
@@ -1222,6 +1223,27 @@ static void dwc2_inchan_irq_handler(struct usbh_bus *bus, uint8_t ch_num)
                     dwc2_urb_waitup(urb);
                 }
             }
+        } else if (chan->poll_oneshot &&
+                   !chan->do_ssplit && !chan->do_csplit &&
+                   (USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_BULK ||
+                    USB_GET_ENDPOINT_TYPE(urb->ep->bmAttributes) == USB_ENDPOINT_TYPE_INTERRUPT) &&
+                   chan->xferlen > (USB_OTG_HC(ch_num)->HCTSIZ & USB_OTG_HCTSIZ_XFRSIZ)) {
+            uint32_t count = chan->xferlen -
+                (USB_OTG_HC(ch_num)->HCTSIZ & USB_OTG_HCTSIZ_XFRSIZ);
+            uint8_t data_toggle = ((USB_OTG_HC(ch_num)->HCTSIZ &
+                                    USB_OTG_HCTSIZ_DPID) >>
+                                   USB_OTG_HCTSIZ_DPID_Pos);
+
+            chan->nak_pending = false;
+            urb->actual_length += count;
+            urb->transfer_buffer_length -= count;
+            urb->data_toggle = data_toggle == HC_PID_DATA0 ? 0 : 1;
+            usb_dcache_invalidate((uintptr_t)urb->transfer_buffer,
+                                  USB_ALIGN_UP(urb->actual_length,
+                                               CONFIG_USB_ALIGN_SIZE));
+            urb->errorcode = 0;
+            g_dwc2_poll_salvage++;
+            dwc2_urb_waitup(urb);
         } else if (chan->poll_oneshot && chan->nak_pending) {
             chan->nak_pending = false;
             urb->errorcode = -USB_ERR_NAK;
