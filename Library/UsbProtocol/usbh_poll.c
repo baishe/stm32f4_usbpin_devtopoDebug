@@ -44,6 +44,7 @@ struct poll_slot {
     uint16_t pid;
     uint32_t rx_packets;
     uint32_t nak_count;
+    uint32_t zlp_count;
     uint32_t err_count;
     uint32_t err_streak;
     uint32_t next_poll_round;
@@ -568,6 +569,7 @@ static void poll_complete(void *arg, int nbytes)
             s->buf = NULL;
         }
     } else if (urb->errorcode == 0) {
+        s->zlp_count++;
         poll_error_recover(s);
         usbh_poll_buf_release(buf);
         s->buf = NULL;
@@ -894,22 +896,24 @@ void usbh_poll_stats_dump(void)
     for (uint8_t i = 0; i < USBH_POLL_MAX_SLOTS; i++) {
         if (g_slots[i].state != POLL_FREE) {
             if (g_dwt_ok) {
-                USB_LOG_INFO("[slot%u] path=%u-%u-%u addr=%u vid=%04x pid=%04x rx=%lu nak=%lu err=%lu err_streak=%lu max_us=%lu urbto=%lu evt_drop=%lu\r\n",
+                USB_LOG_INFO("[slot%u] path=%u-%u-%u addr=%u vid=%04x pid=%04x rx=%lu nak=%lu zlp=%lu err=%lu err_streak=%lu max_us=%lu urbto=%lu evt_drop=%lu\r\n",
                              i, g_slots[i].path[0], g_slots[i].path[1], g_slots[i].path[2],
                              g_slots[i].dev_addr, g_slots[i].vid, g_slots[i].pid,
                              (unsigned long)g_slots[i].rx_packets,
                              (unsigned long)g_slots[i].nak_count,
+                             (unsigned long)g_slots[i].zlp_count,
                              (unsigned long)g_slots[i].err_count,
                              (unsigned long)g_slots[i].err_streak,
                              (unsigned long)g_slots[i].max_us,
                              (unsigned long)g_slots[i].timeout_count,
                              (unsigned long)g_slots[i].evt_drop);
             } else {
-                USB_LOG_INFO("[slot%u] path=%u-%u-%u addr=%u vid=%04x pid=%04x rx=%lu nak=%lu err=%lu err_streak=%lu max_us=na urbto=%lu evt_drop=%lu\r\n",
+                USB_LOG_INFO("[slot%u] path=%u-%u-%u addr=%u vid=%04x pid=%04x rx=%lu nak=%lu zlp=%lu err=%lu err_streak=%lu max_us=na urbto=%lu evt_drop=%lu\r\n",
                              i, g_slots[i].path[0], g_slots[i].path[1], g_slots[i].path[2],
                              g_slots[i].dev_addr, g_slots[i].vid, g_slots[i].pid,
                              (unsigned long)g_slots[i].rx_packets,
                              (unsigned long)g_slots[i].nak_count,
+                             (unsigned long)g_slots[i].zlp_count,
                              (unsigned long)g_slots[i].err_count,
                              (unsigned long)g_slots[i].err_streak,
                              (unsigned long)g_slots[i].timeout_count,
