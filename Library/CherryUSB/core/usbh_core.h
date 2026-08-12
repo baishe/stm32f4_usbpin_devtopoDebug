@@ -175,6 +175,12 @@ struct usbh_hub {
     struct usbh_urb intin_urb;
     uint8_t *int_buffer;
     struct usb_osal_timer *int_timer;
+    /* CherryUSB deviation: hub polling recovery state. */
+    uint8_t int_poll_count;
+    uint16_t int_error_count;
+    uint16_t int_submit_error_count;
+    uint16_t rescan_mask;
+    uint8_t enum_fail_count[CONFIG_USBHOST_MAX_EHPORTS];
 };
 
 struct usbh_devaddr_map {

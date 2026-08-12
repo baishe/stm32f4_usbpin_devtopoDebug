@@ -4,6 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "usbd_core.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include <stdio.h>
 
 #define WINUSB_VENDOR_CODE 0x17
 
@@ -121,6 +124,11 @@ USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t read_buffer[2048];
 USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t write_buffer[2048];
 
 volatile bool ep_tx_busy_flag = false;
+static volatile bool usbd_configured_flag = false;
+static uint32_t usbd_send_count = 0;
+
+#define USBD_PERIODIC_TASK_STACK_SIZE 256
+#define USBD_PERIODIC_SEND_INTERVAL_MS 1500
 
 static void usbd_event_handler(uint8_t busid, uint8_t event)
 {
@@ -128,12 +136,17 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
     switch (event) {
         case USBD_EVENT_RESET:
             USB_LOG_RAW("dev[%d]:Reset\r\n", busid);
+            usbd_configured_flag = false;
+            break;
+        case USBD_EVENT_DISCONNECTED:
+            usbd_configured_flag = false;
             break;
         case USBD_EVENT_SUSPEND:        // 应该是设备接入或插拔
             ep_tx_busy_flag = false;
             break;
         case USBD_EVENT_CONFIGURED:
             USB_LOG_RAW("dev[%d]:Connected\r\n", busid);    // 枚举成功
+            usbd_configured_flag = true;
             ep_tx_busy_flag = false;
             /* setup first out ep read transfer */
             usbd_ep_start_read(busid, WINUSB_OUT_EP, read_buffer, 2048);
@@ -149,7 +162,12 @@ void usbd_winusb_out(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
     USB_LOG_RAW("dev[%d]: rev len %d\r\n", busid, nbytes);
 
-    usbd_ep_start_write(busid, WINUSB_IN_EP, read_buffer, nbytes);
+    if (!ep_tx_busy_flag) {
+        ep_tx_busy_flag = true;
+        if (usbd_ep_start_write(busid, WINUSB_IN_EP, read_buffer, nbytes) < 0) {
+            ep_tx_busy_flag = false;
+        }
+    }
     
     /* setup next out ep read transfer */
     usbd_ep_start_read(busid, WINUSB_OUT_EP, read_buffer, 2048);
@@ -183,6 +201,35 @@ struct usbd_endpoint winusb_in_ep1 = {
 
 #define BUSID 0
 
+static void usbd_periodic_send_task(void *pvParameters)
+{
+    int len;
+    int ret;
+
+    (void)pvParameters;
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(USBD_PERIODIC_SEND_INTERVAL_MS));
+        if (!usbd_configured_flag || ep_tx_busy_flag) {
+            continue;
+        }
+
+        len = snprintf((char *)write_buffer, sizeof(write_buffer), "cnt %lu\r",
+                       (unsigned long)usbd_send_count);
+        if (len < 0 || len >= (int)sizeof(write_buffer)) {
+            continue;
+        }
+
+        ep_tx_busy_flag = true;
+        ret = usbd_ep_start_write(BUSID, WINUSB_IN_EP, write_buffer, (uint32_t)len);
+        if (ret == 0) {
+            usbd_send_count++;
+        } else {
+            ep_tx_busy_flag = false;
+        }
+    }
+}
+
 struct usbd_interface intf0;
 
 void usbd_init(void )
@@ -198,5 +245,14 @@ void usbd_init(void )
     usbd_add_endpoint(busid, &winusb_in_ep1);
 
     usbd_initialize(busid, reg_base, usbd_event_handler);
+
+    if (xTaskCreate(usbd_periodic_send_task,
+                    "UsbdPeriodic",
+                    USBD_PERIODIC_TASK_STACK_SIZE,
+                    NULL,
+                    tskIDLE_PRIORITY + 2,
+                    NULL) != pdPASS) {
+        Error_Handler();
+    }
 }
 

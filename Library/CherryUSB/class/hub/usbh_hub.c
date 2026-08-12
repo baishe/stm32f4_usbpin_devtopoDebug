@@ -16,6 +16,7 @@
 #define HUB_DEBOUNCE_STEP      25
 #define HUB_DEBOUNCE_STABLE    100
 #define DELAY_TIME_AFTER_RESET 200
+#define HUB_RESCAN_INTERVAL    8
 
 #define EXTHUB_FIRST_INDEX 2
 
@@ -306,29 +307,69 @@ static int usbh_hub_set_depth(struct usbh_hub *hub, uint16_t depth)
 static void hub_int_complete_callback(void *arg, int nbytes)
 {
     struct usbh_hub *hub = (struct usbh_hub *)arg;
+    uint16_t rescan_mask;
+    size_t flags;
 
-    if (nbytes > 0) {
-        usbh_hub_thread_wakeup(hub);
-    } else if (nbytes == -USB_ERR_NAK) {
-        /* Restart timer to submit urb again */
-        USB_LOG_DBG("Restart timer\r\n");
-        usb_osal_timer_start(hub->int_timer);
+    if (!hub->connected || nbytes == -USB_ERR_SHUTDOWN) {
+        return;
+    } else if (nbytes > 0) {
+        hub->int_poll_count = 0;
+        hub->int_error_count = 0;
+        if (usbh_hub_thread_wakeup(hub) < 0) {
+            usb_osal_timer_start(hub->int_timer);
+        }
     } else {
+        if (nbytes != -USB_ERR_NAK) {
+            hub->int_error_count++;
+            if (hub->int_error_count == 1 || (hub->int_error_count % 20) == 0) {
+                USB_LOG_WRN("Hub interrupt transfer failed, errorcode: %d\r\n", nbytes);
+            }
+        }
+
+        hub->int_poll_count++;
+        if (hub->int_poll_count >= HUB_RESCAN_INTERVAL) {
+            hub->int_poll_count = 0;
+            rescan_mask = (uint16_t)((1U << (hub->nports + 1)) - 2U);
+            flags = usb_osal_enter_critical_section();
+            hub->rescan_mask |= rescan_mask;
+            usb_osal_leave_critical_section(flags);
+            if (usbh_hub_thread_wakeup(hub) < 0) {
+                usb_osal_timer_start(hub->int_timer);
+            }
+            /* CherryUSB deviation: periodically rescan after missed changes. */
+        } else {
+            usb_osal_timer_start(hub->int_timer);
+        }
     }
 }
 
 static void hub_int_timeout(void *arg)
 {
     struct usbh_hub *hub = (struct usbh_hub *)arg;
+    int ret;
+
+    if (!hub->connected) {
+        return;
+    }
 
     usbh_int_urb_fill(&hub->intin_urb, hub->parent, hub->intin, hub->int_buffer, 1, 0, hub_int_complete_callback, hub);
-    usbh_submit_urb(&hub->intin_urb);
+    ret = usbh_submit_urb(&hub->intin_urb);
+    if (ret == 0) {
+        hub->int_submit_error_count = 0;
+    } else if (hub->connected) {
+        hub->int_submit_error_count++;
+        if (hub->int_submit_error_count == 1 || (hub->int_submit_error_count % 20) == 0) {
+            USB_LOG_WRN("Failed to submit hub interrupt urb, errorcode: %d\r\n", ret);
+        }
+        usb_osal_timer_start(hub->int_timer);
+    }
 }
 
 static int usbh_hub_connect(struct usbh_hubport *hport, uint8_t intf)
 {
     struct usb_endpoint_descriptor *ep_desc;
     struct hub_port_status port_status;
+    uint16_t initial_port_mask = 0;
     int ret;
 
     struct usbh_hub *hub = usbh_hub_class_alloc();
@@ -422,9 +463,13 @@ static int usbh_hub_connect(struct usbh_hubport *hport, uint8_t intf)
 
     for (uint8_t port = 0; port < hub->nports; port++) {
         ret = usbh_hub_get_portstatus(hub, port + 1, &port_status);
-        USB_LOG_DBG("port %u, status:0x%03x, change:0x%02x\r\n", port + 1, port_status.wPortStatus, port_status.wPortChange);
         if (ret < 0) {
             return ret;
+        }
+        USB_LOG_DBG("port %u, status:0x%03x, change:0x%02x\r\n", port + 1, port_status.wPortStatus, port_status.wPortChange);
+        if (port_status.wPortStatus & HUB_PORT_STATUS_CONNECTION) {
+            initial_port_mask |= (uint16_t)(1U << (port + 1));
+            USB_LOG_INFO("Hub %u initial scan: port %u connected, scheduling enumeration\r\n", hub->index, port + 1);
         }
     }
 
@@ -440,7 +485,15 @@ static int usbh_hub_connect(struct usbh_hubport *hport, uint8_t intf)
         USB_LOG_ERR("No memory to alloc int_timer\r\n");
         return -USB_ERR_NOMEM;
     }
-    usb_osal_timer_start(hub->int_timer);
+    if (initial_port_mask) {
+        hub->rescan_mask = initial_port_mask;
+        if (usbh_hub_thread_wakeup(hub) < 0) {
+            usb_osal_timer_start(hub->int_timer);
+        }
+        /* CherryUSB deviation: enumerate devices already connected at hub attach. */
+    } else {
+        usb_osal_timer_start(hub->int_timer);
+    }
     return 0;
 }
 
@@ -486,6 +539,9 @@ static void usbh_hub_events(struct usbh_hub *hub)
     uint16_t mask;
     uint16_t feat;
     uint8_t speed;
+    bool genuine_connection_change;
+    bool port_needs_handling;
+    bool rescan_retry;
     int ret;
     size_t flags;
 
@@ -497,6 +553,8 @@ static void usbh_hub_events(struct usbh_hub *hub)
 
     flags = usb_osal_enter_critical_section();
     memcpy(&portchange_index, hub->int_buffer, 2);
+    portchange_index |= hub->rescan_mask;
+    hub->rescan_mask = 0;
     usb_osal_leave_critical_section(flags);
 
     for (uint8_t port = 0; port < hub->nports; port++) {
@@ -519,6 +577,10 @@ static void usbh_hub_events(struct usbh_hub *hub)
         portchange = port_status.wPortChange;
 
         USB_LOG_DBG("port %u, status:0x%03x, change:0x%02x\r\n", port + 1, portstatus, portchange);
+        genuine_connection_change = (portchange & HUB_PORT_STATUS_C_CONNECTION) != 0;
+        if (genuine_connection_change) {
+            hub->enum_fail_count[port] = 0;
+        }
 
         /* First, clear all change bits */
         mask = 1;
@@ -539,7 +601,19 @@ static void usbh_hub_events(struct usbh_hub *hub)
         portchange = port_status.wPortChange;
 
         /* Second, if port changes, debounces first */
-        if (portchange & HUB_PORT_STATUS_C_CONNECTION) {
+        port_needs_handling = (portchange & HUB_PORT_STATUS_C_CONNECTION) ||
+                              ((portstatus & HUB_PORT_STATUS_CONNECTION) && !hub->child[port].connected) ||
+                              (!(portstatus & HUB_PORT_STATUS_CONNECTION) && hub->child[port].connected);
+        rescan_retry = !genuine_connection_change &&
+                       (portstatus & HUB_PORT_STATUS_CONNECTION) &&
+                       !hub->child[port].connected;
+        if (rescan_retry && hub->enum_fail_count[port] >= 3) {
+            continue;
+        }
+        if (rescan_retry) {
+            USB_LOG_INFO("Hub %u rescan: scheduling port %u enumeration\r\n", hub->index, port + 1);
+        }
+        if (port_needs_handling) {
             uint16_t connection = 0;
             uint16_t debouncestable = 0;
             for (uint32_t debouncetime = 0; debouncetime < HUB_DEBOUNCE_TIMEOUT; debouncetime += HUB_DEBOUNCE_STEP) {
@@ -649,7 +723,12 @@ static void usbh_hub_events(struct usbh_hub *hub)
                     if (usbh_enumerate(child) < 0) {
                         /** release child sources */
                         usbh_hubport_release(child);
+                        if (rescan_retry && hub->enum_fail_count[port] < 3) {
+                            hub->enum_fail_count[port]++;
+                        }
                         USB_LOG_ERR("Port %u enumerate fail\r\n", child->port);
+                    } else {
+                        hub->enum_fail_count[port] = 0;
                     }
                 } else {
                     child = &hub->child[port];
@@ -709,9 +788,9 @@ static void usbh_hub_thread(CONFIG_USB_OSAL_THREAD_SET_ARGV)
     usb_osal_thread_delete(NULL);
 }
 
-void usbh_hub_thread_wakeup(struct usbh_hub *hub)
+int usbh_hub_thread_wakeup(struct usbh_hub *hub)
 {
-    usb_osal_mq_send(hub->bus->hub_mq, (uintptr_t)hub);
+    return usb_osal_mq_send(hub->bus->hub_mq, (uintptr_t)hub);
 }
 
 int usbh_hub_initialize(struct usbh_bus *bus)
