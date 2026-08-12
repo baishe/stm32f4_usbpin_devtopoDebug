@@ -11,19 +11,21 @@ static volatile uint16_t s_tail;
 static volatile uint16_t s_tx_len;
 static volatile uint8_t s_tx_busy;
 
-#define ENTER_CRITICAL() __disable_irq()
-#define EXIT_CRITICAL() __enable_irq()
+/* Keep the caller's interrupt state: logging may happen inside a critical section. */
+#define ENTER_CRITICAL()  uint32_t primask = __get_PRIMASK(); __disable_irq()
+#define EXIT_CRITICAL()   __set_PRIMASK(primask)
 
 static void usb_log_kick(void)
 {
     uint16_t len;
-    uint16_t contiguous;
     if (s_tx_busy || s_tail == s_head) return;
-    contiguous = (s_head > s_tail) ? (s_head - s_tail) : (USB_LOG_BUF_SIZE - s_tail);
-    len = contiguous;
+    len = (s_head > s_tail) ? (uint16_t)(s_head - s_tail) : (uint16_t)(USB_LOG_BUF_SIZE - s_tail);
     s_tx_len = len;
     s_tx_busy = 1;
-    (void)HAL_UART_Transmit_IT(&huart1, &s_log_buf[s_tail], len);
+    if (HAL_UART_Transmit_IT(&huart1, &s_log_buf[s_tail], len) != HAL_OK) {
+        s_tx_len = 0;
+        s_tx_busy = 0;
+    }
 }
 
 void usb_log_write(const char *fmt, ...)
@@ -34,6 +36,7 @@ void usb_log_write(const char *fmt, ...)
     va_start(args, fmt);
     len = vsnprintf(tmp, sizeof(tmp), fmt, args);
     va_end(args);
+    if (len < 0) return;
     if (len >= (int)sizeof(tmp)) len = sizeof(tmp) - 1;
     ENTER_CRITICAL();
     for (i = 0; i < len; i++) {
