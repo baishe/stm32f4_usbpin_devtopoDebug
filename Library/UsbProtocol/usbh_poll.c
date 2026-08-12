@@ -44,6 +44,9 @@ struct poll_slot {
     uint32_t rx_packets;
     uint32_t nak_count;
     uint32_t err_count;
+    uint32_t err_streak;
+    uint32_t next_poll_round;
+    int16_t err_last_code;
     uint32_t timeout_count;
     uint32_t evt_drop;
     uint32_t last_us;
@@ -184,7 +187,7 @@ static bool poll_same_path(const struct poll_slot *s, const uint8_t *path, uint8
 }
 
 static bool poll_event(struct poll_slot *s, uint8_t type, uint8_t *data,
-                       uint16_t len, int errorcode)
+                       uint16_t len, int errorcode, uint16_t count)
 {
     struct usbh_poll_event ev;
     BaseType_t woken = pdFALSE;
@@ -201,6 +204,7 @@ static bool poll_event(struct poll_slot *s, uint8_t type, uint8_t *data,
     ev.data = data;
     ev.len = len;
     ev.errorcode = (int16_t)errorcode;
+    ev.count = count;
     if (in_isr) {
         if (xQueueSendFromISR(g_event_queue, &ev, &woken) != pdTRUE) {
             g_evt_drop++;
@@ -219,6 +223,50 @@ static bool poll_event(struct poll_slot *s, uint8_t type, uint8_t *data,
     }
     if (high > g_evtq_high) g_evtq_high = high;
     return true;
+}
+
+static uint16_t poll_error_count(const struct poll_slot *s)
+{
+    return s->err_streak > 0xffffU ? 0xffffU : (uint16_t)s->err_streak;
+}
+
+static void poll_error_record(struct poll_slot *s, int errorcode,
+                              bool report_first)
+{
+    size_t flags;
+    bool first = false;
+    poll_critical_enter(&flags);
+    s->err_count++;
+    s->err_last_code = (int16_t)errorcode;
+    if (s->err_streak != 0xffffffffU) s->err_streak++;
+    if (s->err_streak >= 4U) {
+        s->next_poll_round = g_round + 32U;
+    }
+    first = report_first && s->err_streak == 1U;
+    poll_critical_leave(flags);
+    if (first) {
+        poll_event(s, USBH_POLL_EVENT_ERROR, NULL, 0, errorcode, 1);
+    }
+}
+
+static void poll_error_recover(struct poll_slot *s)
+{
+    size_t flags;
+    uint16_t count = 0;
+    int16_t errorcode = 0;
+    poll_critical_enter(&flags);
+    if (s->err_streak > 1U) {
+        count = poll_error_count(s);
+        errorcode = s->err_last_code;
+    }
+    s->err_streak = 0;
+    s->next_poll_round = 0;
+    s->err_last_code = 0;
+    poll_critical_leave(flags);
+    if (count != 0) {
+        poll_event(s, USBH_POLL_EVENT_ERROR, NULL, 0,
+                   errorcode, count);
+    }
 }
 
 static void poll_complete(void *arg, int nbytes);
@@ -298,7 +346,8 @@ static void poll_pump(void)
         }
         s = &g_slots[g_cursor++];
         if (s->in_queue && s->state == POLL_IDLE && s->bulkin &&
-            !g_pool_blocked) {
+            !g_pool_blocked &&
+            (s->next_poll_round == 0 || g_round >= s->next_poll_round)) {
             s->state = POLL_INFLIGHT;
             g_inflight++;
             g_round_scan++;
@@ -408,6 +457,7 @@ static void poll_complete(void *arg, int nbytes)
         if (timeout) {
             s->timeout_count++;
             g_timeout_count++;
+            poll_error_record(s, -USB_ERR_TIMEOUT, false);
             s->timeout_report = true;
         }
         if (unregister) {
@@ -419,7 +469,8 @@ static void poll_complete(void *arg, int nbytes)
     if (!s->in_queue) {
         usbh_poll_buf_release(buf);
         s->buf = NULL;
-        poll_event(s, USBH_POLL_EVENT_DETACH, NULL, 0, 0);
+        poll_error_recover(s);
+        poll_event(s, USBH_POLL_EVENT_DETACH, NULL, 0, 0, 0);
         s->winusb = NULL;
         s->hport = NULL;
         s->bulkin = NULL;
@@ -456,27 +507,30 @@ static void poll_complete(void *arg, int nbytes)
         g_timeout_count++;
         usbh_poll_buf_release(buf);
         s->buf = NULL;
-        poll_event(s, USBH_POLL_EVENT_ERROR, NULL, 0, -USB_ERR_TIMEOUT);
+        poll_event(s, USBH_POLL_EVENT_ERROR, NULL, 0, -USB_ERR_TIMEOUT, 1);
     } else if (urb->errorcode == -USB_ERR_NAK) {
         s->nak_count++;
+        poll_error_recover(s);
         usbh_poll_buf_release(buf);
         s->buf = NULL;
     } else if (urb->errorcode == 0 && urb->actual_length > 0) {
         s->rx_packets++;
-        if (poll_event(s, USBH_POLL_EVENT_DATA, buf, (uint16_t)urb->actual_length, 0)) {
+        poll_error_recover(s);
+        if (poll_event(s, USBH_POLL_EVENT_DATA, buf,
+                       (uint16_t)urb->actual_length, 0, 0)) {
             s->buf = NULL;
         } else {
             usbh_poll_buf_release(buf);
             s->buf = NULL;
         }
     } else if (urb->errorcode == 0) {
+        poll_error_recover(s);
         usbh_poll_buf_release(buf);
         s->buf = NULL;
     } else {
-        s->err_count++;
+        poll_error_record(s, urb->errorcode, true);
         usbh_poll_buf_release(buf);
         s->buf = NULL;
-        poll_event(s, USBH_POLL_EVENT_ERROR, NULL, 0, urb->errorcode);
     }
     poll_pump();
 }
@@ -504,12 +558,21 @@ static void poll_drain_reports(void)
     for (i = 0; i < USBH_POLL_MAX_SLOTS; i++) {
         struct poll_slot *s = &g_slots[i];
         if (s->timeout_report) {
+            size_t flags;
+            bool first;
+            poll_critical_enter(&flags);
             s->timeout_report = false;
-            poll_event(s, USBH_POLL_EVENT_ERROR, NULL, 0, -USB_ERR_TIMEOUT);
+            first = s->err_streak == 1U;
+            poll_critical_leave(flags);
+            if (first) {
+                poll_event(s, USBH_POLL_EVENT_ERROR, NULL, 0,
+                           -USB_ERR_TIMEOUT, 1);
+            }
         }
         if (s->detach_report) {
             s->detach_report = false;
-            poll_event(s, USBH_POLL_EVENT_DETACH, NULL, 0, 0);
+            poll_error_recover(s);
+            poll_event(s, USBH_POLL_EVENT_DETACH, NULL, 0, 0, 0);
             s->winusb = NULL;
             s->hport = NULL;
             s->bulkin = NULL;
@@ -613,7 +676,7 @@ int usbh_poll_register(struct usbh_winusb *winusb)
     s->hub_addr = s->hport->parent ? s->hport->parent->hub_addr : 0;
     s->vid = s->hport->device_desc.idVendor;
     s->pid = s->hport->device_desc.idProduct;
-    poll_event(s, USBH_POLL_EVENT_ATTACH, NULL, 0, 0);
+    poll_event(s, USBH_POLL_EVENT_ATTACH, NULL, 0, 0, 0);
     if (g_selftest_state == USBH_POLL_SELFTEST_IDLE) {
         g_selftest_state = USBH_POLL_SELFTEST_RUNNING;
         g_selftest_slot = (uint8_t)(s - g_slots);
@@ -673,7 +736,8 @@ void usbh_poll_unregister(struct usbh_winusb *winusb)
             poll_critical_leave(flags);
             poll_drain_reports();
             if (s->state == POLL_IDLE) {
-                poll_event(s, USBH_POLL_EVENT_DETACH, NULL, 0, 0);
+                poll_error_recover(s);
+                poll_event(s, USBH_POLL_EVENT_DETACH, NULL, 0, 0, 0);
                 s->winusb = NULL;
                 s->hport = NULL;
                 s->bulkin = NULL;
@@ -764,12 +828,13 @@ void usbh_poll_stats_dump(void)
                  (unsigned long)g_timeout_count, (unsigned long)evt_drop);
     for (uint8_t i = 0; i < USBH_POLL_MAX_SLOTS; i++) {
         if (g_slots[i].state != POLL_FREE) {
-            USB_LOG_INFO("[slot%u] path=%u-%u-%u addr=%u vid=%04x pid=%04x rx=%lu nak=%lu err=%lu max_us=%lu urbto=%lu evt_drop=%lu\r\n",
+            USB_LOG_INFO("[slot%u] path=%u-%u-%u addr=%u vid=%04x pid=%04x rx=%lu nak=%lu err=%lu err_streak=%lu max_us=%lu urbto=%lu evt_drop=%lu\r\n",
                          i, g_slots[i].path[0], g_slots[i].path[1], g_slots[i].path[2],
                          g_slots[i].dev_addr, g_slots[i].vid, g_slots[i].pid,
                          (unsigned long)g_slots[i].rx_packets,
                          (unsigned long)g_slots[i].nak_count,
                          (unsigned long)g_slots[i].err_count,
+                         (unsigned long)g_slots[i].err_streak,
                          (unsigned long)g_slots[i].max_us,
                          (unsigned long)g_slots[i].timeout_count,
                          (unsigned long)g_slots[i].evt_drop);

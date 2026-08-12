@@ -118,7 +118,8 @@ static void UsbEventTask(void *arg)
 #endif
                 usbh_poll_buf_release(ev.data);
             } else if (ev.type == USBH_POLL_EVENT_ERROR) {
-                USB_LOG_ERR("[poll] slot=%u error=%d\r\n", ev.slot, ev.errorcode);
+                USB_LOG_ERR("[poll] slot=%u error=%d streak=%u\r\n",
+                            ev.slot, ev.errorcode, ev.count);
             } else {
                 USB_LOG_INFO("[poll] slot=%u event=%u path=%u-%u-%u\r\n", ev.slot, ev.type, ev.path[0], ev.path[1], ev.path[2]);
             }

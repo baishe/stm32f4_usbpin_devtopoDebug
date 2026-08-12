@@ -28,6 +28,7 @@ struct usbh_poll_event {
     uint8_t path[4];
     uint8_t dev_addr;
     int16_t errorcode;
+    uint16_t count;
     uint16_t len;
     uint8_t *data;
 };
