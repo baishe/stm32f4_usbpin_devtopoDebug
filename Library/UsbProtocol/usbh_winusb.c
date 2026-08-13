@@ -1,5 +1,6 @@
 #include "usbh_core.h"
 #include "usbh_winusb.h"
+#include "usbh_poll.h"
 
 #undef USB_DBG_TAG
 #define USB_DBG_TAG "usbh_winusb"
@@ -148,6 +149,7 @@ static int usbh_winusb_connect(struct usbh_hubport *hport, uint8_t intf)
     USB_LOG_INFO("Register WinUSB Class: %s\r\n", hport->config.intf[intf].devname);
 
     /* 检查通过且注册成功后通知应用层 */
+    usbh_poll_register(winusb);
     usbh_winusb_notify_connect(hport->config.intf[intf].devname);
 
     return 0;
@@ -157,6 +159,7 @@ static int usbh_winusb_disconnect(struct usbh_hubport *hport, uint8_t intf)
 {
     struct usbh_winusb *winusb = (struct usbh_winusb *)hport->config.intf[intf].priv;
     if (winusb) {
+        usbh_poll_unregister(winusb);
         usbh_winusb_notify_disconnect(hport->config.intf[intf].devname);
         usbh_winusb_close(winusb);
         usbh_winusb_free(winusb);
@@ -190,9 +193,6 @@ int usbh_winusb_close(struct usbh_winusb *winusb)
     if (winusb->ref_count == 0) {
         return 0;
     }
-    if (winusb->bulkin) {
-        usbh_kill_urb(&winusb->bulkin_urb);
-    }
     if (winusb->bulkout) {
         usbh_kill_urb(&winusb->bulkout_urb);
     }
@@ -213,26 +213,6 @@ int usbh_winusb_write(struct usbh_winusb *winusb, const uint8_t *buffer, uint32_
     urb = &winusb->bulkout_urb;
     usbh_bulk_urb_fill(urb, winusb->hport, winusb->bulkout,
                        (uint8_t *)buffer, len, 0xffffffff, NULL, NULL);
-    ret = usbh_submit_urb(urb);
-    if (ret == 0) {
-        ret = urb->actual_length;
-    }
-    return ret;
-}
-
-int usbh_winusb_read(struct usbh_winusb *winusb, uint8_t *buffer, uint32_t len)
-{
-    struct usbh_urb *urb;
-    int ret;
-    if (!winusb || !winusb->hport || !winusb->hport->connected || !winusb->bulkin) {
-        return -USB_ERR_INVAL;
-    }
-    if (winusb->ref_count == 0) {
-        return -USB_ERR_NODEV;
-    }
-    urb = &winusb->bulkin_urb;
-    usbh_bulk_urb_fill(urb, winusb->hport, winusb->bulkin,
-                       buffer, len, 0xffffffff, NULL, NULL);
     ret = usbh_submit_urb(urb);
     if (ret == 0) {
         ret = urb->actual_length;

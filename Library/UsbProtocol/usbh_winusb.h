@@ -25,7 +25,6 @@ struct usbh_winusb {
     struct usb_endpoint_descriptor *bulkout;  /* Bulk OUT endpoint */
 
     struct usbh_urb bulkout_urb;
-    struct usbh_urb bulkin_urb;
 
     uint8_t *iobuffer;          /* I/O buffer for transfers */
     uint8_t ref_count;
@@ -60,16 +59,6 @@ int usbh_winusb_close(struct usbh_winusb *winusb);
  * @return Number of bytes written, or negative error code
  */
 int usbh_winusb_write(struct usbh_winusb *winusb, const uint8_t *buffer, uint32_t len);
-
-/**
- * @brief Read data from the device (Bulk IN)
- *
- * @param winusb WinUSB instance
- * @param buffer Data buffer
- * @param len    Maximum data length to read
- * @return Number of bytes read, or negative error code
- */
-int usbh_winusb_read(struct usbh_winusb *winusb, uint8_t *buffer, uint32_t len);
 
 /**
  * @brief Send a vendor-specific control request

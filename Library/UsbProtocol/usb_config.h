@@ -159,6 +159,19 @@ void usb_log_write(const char *fmt, ...);
 #define CONFIG_USBHOST_MAX_INTF_ALTSETTINGS 2       // 单个设备的最大备用设置数
 #define CONFIG_USBHOST_MAX_ENDPOINTS        4       // 单个设备枚举端口低于n个才识别
 
+#define CONFIG_USBHOST_MAX_WINUSB_CLASS     20       // Maximum WinUSB devices
+#define CONFIG_USB_DWC2_POLL_CHANNELS      3        // Reserved oneshot polling channels
+#define USBH_URB_FLAG_POLL_ONESHOT         (1 << 0) // One-shot polling URB
+#ifndef USBH_POLL_FULL_HEXDUMP
+#define USBH_POLL_FULL_HEXDUMP              0        // Enable full DATA hexdump
+#endif
+#ifndef USBH_POLL_DEBUG_PIN_SELFTEST_ONLY
+#define USBH_POLL_DEBUG_PIN_SELFTEST_ONLY   1        // Toggle debug pin only during selftest
+#endif
+#ifndef USBH_POLL_SELFTEST_VERBOSE
+#define USBH_POLL_SELFTEST_VERBOSE          0        // Enable verbose selftest samples
+#endif
+
 //#define CONFIG_USBHOST_MAX_WINUSB_CLASS     2
 //#define CONFIG_USBHOST_MAX_SERIAL_CLASS  4
 //#define CONFIG_USBHOST_MAX_HID_CLASS     4

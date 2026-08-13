@@ -1,27 +1,33 @@
 #include "main.h"
 #include "usbh_core.h"
 #include "usbh_winusb.h"
+#include "usbh_poll.h"
 #include "FreeRTOS.h"
 #include "task.h"
-#include "semphr.h"
 #include "usb_log.h"
 #include <string.h>
+#include <stdio.h>
 
-#define HOST_DEMO_TASK_STACK_SIZE  512
-
-/* -------------------------------------------------------------------------- */
-/* 信号量与设备名缓冲区，用于连接通知                                       */
-/* -------------------------------------------------------------------------- */
-static SemaphoreHandle_t g_winusb_sem = NULL;
-static char g_winusb_devname[CONFIG_USBHOST_DEV_NAMELEN];
-static volatile uint32_t g_winusb_disconnect_seq = 0;
-
-static void HostDemoTask(void *pvParameters);
-
-/* -------------------------------------------------------------------------- */
-/* 产品字符串验证关键词（请与实际 Device 端保持一致）                        */
-/* -------------------------------------------------------------------------- */
 #define WINUSB_PRODUCT_STRING_KEYWORD  "WINUSB DEMO"
+
+#if USBH_POLL_FULL_HEXDUMP
+static void poll_hexdump(const uint8_t *data, uint16_t len)
+{
+    char line[49];
+    uint16_t off;
+    for (off = 0; off < len; off += 16) {
+        uint16_t n = len - off > 16 ? 16 : len - off;
+        uint16_t i;
+        for (i = 0; i < n; i++) {
+            snprintf(&line[i * 3], sizeof(line) - i * 3, "%02x ", data[off + i]);
+        }
+        line[n * 3] = 0;
+        USB_LOG_INFO("[poll] dump+%u %s\r\n", off, line);
+    }
+}
+#endif
+
+
 
 /* -------------------------------------------------------------------------- */
 /* 覆盖驱动弱函数：通过产品字符串描述符进行设备身份验证                      */
@@ -76,99 +82,66 @@ int usbh_winusb_check(struct usbh_hubport *hport)
 /* -------------------------------------------------------------------------- */
 /* 覆盖驱动弱函数：接收连接通知，释放信号量给 HostDemoTask                 */
 /* -------------------------------------------------------------------------- */
-void usbh_winusb_notify_connect(const char *devname)
-{
-    if (g_winusb_sem != NULL) {
-        strncpy(g_winusb_devname, devname, CONFIG_USBHOST_DEV_NAMELEN - 1);
-        g_winusb_devname[CONFIG_USBHOST_DEV_NAMELEN - 1] = '\0';
-        xSemaphoreGive(g_winusb_sem);
-    }
-}
-
-void usbh_winusb_notify_disconnect(const char *devname)
-{
-    (void)devname;
-    g_winusb_disconnect_seq++;
-}
-
-/* -------------------------------------------------------------------------- */
-/* USB 主机初始化                                                             */
-/* -------------------------------------------------------------------------- */
-void dummy_event_handler(uint8_t busid, uint8_t hub_index, uint8_t hub_port, uint8_t intf, uint8_t event);
-void usbh_init(void)
-{
-    g_winusb_sem = xSemaphoreCreateBinary();
-    if (g_winusb_sem == NULL) {
-        Error_Handler();
-    }
-
-    usbh_initialize(0, USB_OTG_HS_PERIPH_BASE, dummy_event_handler);
-
-    if (xTaskCreate(HostDemoTask,
-                    "HostDemo",
-                    HOST_DEMO_TASK_STACK_SIZE,
-                    NULL,
-                    tskIDLE_PRIORITY + 2,
-                    NULL) != pdPASS) {
-        Error_Handler();
-    }
-}
-
 void dummy_event_handler(uint8_t busid, uint8_t hub_index, uint8_t hub_port, uint8_t intf, uint8_t event)
 {
-    switch(event) {
-        case USBH_EVENT_INTERFACE_UNSUPPORTED:
-            CONFIG_USB_PRINTF("hub_index: %d, hub_port: %d, intf: %d, event type: %d\n", hub_index, hub_port, intf, event);
-            break;
-        case USBH_EVENT_INTERFACE_START:
-            CONFIG_USB_PRINTF("hub_index: %d, hub_port: %d, intf: %d, event type: %d\n", hub_index, hub_port, intf, event);
-            break;
-        case USBH_EVENT_INTERFACE_STOP:
-            break;
+    switch (event) {
+    case USBH_EVENT_INTERFACE_UNSUPPORTED:
+    case USBH_EVENT_INTERFACE_START:
+        CONFIG_USB_PRINTF("hub_index: %d, hub_port: %d, intf: %d, event type: %d\n",
+                          hub_index, hub_port, intf, event);
+        break;
+    case USBH_EVENT_INTERFACE_STOP:
+        break;
+    default:
+        break;
     }
 }
 
-/* -------------------------------------------------------------------------- */
-/* HostDemoTask: 等待连接信号量，打开对应设备，阻塞等待 Device 发送数据     */
-/* -------------------------------------------------------------------------- */
-struct usbh_winusb *winusb = NULL;
-static void HostDemoTask(void *pvParameters)
+static void UsbEventTask(void *arg)
 {
-    const char *devname;
-    uint8_t rx_buf[64];
-    uint32_t disconnect_seq;
-    int ret;
-
+    struct usbh_poll_event ev;
+    char hex[24];
+    uint8_t i;
+    (void)arg;
     for (;;) {
-        /* 阻塞等待连接通知 */
-        if (xSemaphoreTake(g_winusb_sem, portMAX_DELAY) == pdTRUE) {
-            devname = g_winusb_devname;
-
-            disconnect_seq = g_winusb_disconnect_seq;
-            winusb = usbh_winusb_open(devname, 0);
-            if (!winusb) {
-                USB_LOG_ERR("Failed to open %s\r\n", devname);
-                continue;
-            }
-            USB_LOG_INFO("WinUSB device %s opened\r\n", devname);
-
-            /* 阻塞读循环：等待 Device 端通过串口触发写入 */
-            while (g_winusb_disconnect_seq == disconnect_seq) {
-                ret = usbh_winusb_read(winusb, rx_buf, sizeof(rx_buf));
-                if (ret > 0) {
-                    USB_LOG_INFO("Received %d bytes\r\n", ret);
-                    usb_hexdump(rx_buf, ret);
-                } else {
-                    /* 检查设备是否拔出 */
-                    if (g_winusb_disconnect_seq != disconnect_seq) {
-                        USB_LOG_WRN("Device %s disconnected\r\n", devname);
-                        winusb = NULL;
-                        break;
-                    }
-                    /* 其他错误延时后重试读 */
-                    vTaskDelay(200);
+        if (usbh_poll_event_recv(&ev, portMAX_DELAY) == 0) {
+            usbh_poll_on_event(&ev);
+            if (ev.type == USBH_POLL_EVENT_DATA) {
+                hex[0] = 0;
+                for (i = 0; i < ev.len && i < 8; i++) {
+                    snprintf(&hex[i * 3], sizeof(hex) - i * 3, "%02x ", ev.data[i]);
                 }
+                USB_LOG_INFO("[poll] slot=%u path=%u-%u-%u len=%u data=%s\r\n",
+                             ev.slot, ev.path[0], ev.path[1], ev.path[2], ev.len, hex);
+#if USBH_POLL_FULL_HEXDUMP
+                poll_hexdump(ev.data, ev.len);
+#endif
+                usbh_poll_buf_release(ev.data);
+            } else if (ev.type == USBH_POLL_EVENT_ERROR) {
+                USB_LOG_ERR("[poll] slot=%u error=%d streak=%u\r\n",
+                            ev.slot, ev.errorcode, ev.count);
+            } else {
+                USB_LOG_INFO("[poll] slot=%u event=%u path=%u-%u-%u\r\n", ev.slot, ev.type, ev.path[0], ev.path[1], ev.path[2]);
             }
         }
+    }
+}
+
+static void UsbStatsTask(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        usbh_poll_stats_dump();
+    }
+}
+
+void usbh_init(void)
+{
+    usbh_poll_init();
+    usbh_initialize(0, USB_OTG_HS_PERIPH_BASE, dummy_event_handler);
+    if (xTaskCreate(UsbEventTask, "UsbEvent", 320, NULL, tskIDLE_PRIORITY + 3, NULL) != pdPASS ||
+        xTaskCreate(UsbStatsTask, "UsbStats", 256, NULL, tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
+        Error_Handler();
     }
 }
